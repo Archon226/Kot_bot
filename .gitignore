@@ -1,0 +1,10 @@
+runs/
+*.raw
+*_png/
+*_debug/
+shots/
+taps/
+__pycache__/
+*.pyc
+.venv/
+venv/
