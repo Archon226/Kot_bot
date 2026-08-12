@@ -34,7 +34,7 @@ import os
 
 import numpy as np
 
-import kot_green as kg
+import kot_track_thief as kg
 
 
 def smooth(a, n=5):
@@ -51,6 +51,15 @@ def kinematics(path):
     ok = ~np.isnan(x)
     if ok.sum() < 20:
         raise SystemExit("Tracking too sparse to analyse.")
+
+    # Duplicate or non-increasing timestamps make np.gradient divide by
+    # zero and poison every derivative downstream. Drop them rather than
+    # producing plausible-looking garbage.
+    keep = np.concatenate(([True], np.diff(t) > 1e-6))
+    if not keep.all():
+        print(f"  dropped {int((~keep).sum()) } duplicate timestamps")
+        t, x, y = t[keep], x[keep], y[keep]
+        ok = ok[keep]
     x = np.interp(t, t[ok], x[ok])
     y = np.interp(t, t[ok], y[ok])
 

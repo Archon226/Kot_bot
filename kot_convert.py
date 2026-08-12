@@ -29,7 +29,7 @@ import os
 
 import numpy as np
 
-import kot_green as kg
+import kot_track_thief as kg
 import kot_launch as kl
 
 
@@ -117,8 +117,27 @@ def convert(meta_path, args):
             print(f"dropped {before - len(tap_times)} detections before "
                   f"{args.skip_before}s")
 
+    if args.skip_after:
+        before = len(tap_times)
+        tap_times = [t for t in tap_times if t <= args.skip_after]
+        if before != len(tap_times):
+            print(f"dropped {before - len(tap_times)} detections after "
+                  f"{args.skip_after}s")
+
     if not tap_times:
         raise SystemExit("Nothing left after trimming.")
+
+    # A long silence in the middle almost always means the recording
+    # spans more than one attempt. Replaying across that boundary is
+    # guaranteed to fail, so say so rather than writing a broken file.
+    gaps_s = np.diff(tap_times)
+    if len(gaps_s) and gaps_s.max() > 4.0:
+        k = int(np.argmax(gaps_s))
+        print(f"\n  WARNING: {gaps_s.max():.1f}s gap between "
+              f"{tap_times[k]:.2f}s and {tap_times[k + 1]:.2f}s.")
+        print(f"  That is probably a boundary between two attempts. Use "
+              f"--skip-before {tap_times[k + 1] - 0.5:.1f} or "
+              f"--skip-after {tap_times[k] + 0.5:.1f} to keep just one.")
 
     # Rebase so the first tap sits at the requested lead-in, and optionally
     # prepend the level-start tap that detection can never see.
@@ -174,7 +193,10 @@ def main():
                     help="seconds between start tap and first real tap")
     ap.add_argument("--skip-before", type=float, default=0.0,
                     help="ignore detections before this time")
-    # detector knobs, passed through to kot_green
+    ap.add_argument("--skip-after", type=float, default=0.0,
+                    dest="skip_after",
+                    help="ignore detections after this time")
+    # detector knobs, shared so every script agrees
     kg.add_detector_args(ap)
     ap.add_argument("--still", type=float, default=40,
                     help="px/s below this counts as in contact")
@@ -188,7 +210,6 @@ def main():
                          "the thief upward, landings do not")
     ap.add_argument("--max-entry", type=float, default=600, dest="max_entry",
                     help="reject launches faster than this (animations)")
-    ap.add_argument("--lost-limit", type=int, default=15, dest="lost_limit")
     ap.add_argument("--refractory", type=float, default=0.10)
     args = ap.parse_args()
 

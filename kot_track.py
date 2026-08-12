@@ -40,6 +40,7 @@ import ctypes
 import json
 import os
 import time
+from collections import deque
 
 import cv2
 import keyboard
@@ -109,7 +110,47 @@ def grab_bgr(sct, region, w, h):
     return cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
 
 
-def record(region, mode):
+def motion_level(prev_small, small):
+    """Cheap scene-motion metric: mean abs difference on a tiny greyscale
+    thumbnail. Costs ~0.1ms, so it can run inside the capture loop without
+    risking dropped frames."""
+    return float(np.abs(small.astype(np.int16) - prev_small).mean())
+
+
+def thumb(frame):
+    g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(g, (80, 45), interpolation=cv2.INTER_AREA)
+
+
+def motion_scan(region):
+    """Print the live motion metric so you can pick a threshold.
+
+    Watch it while the game sits idle, then while a run is playing. Set
+    --motion-thresh between the two.
+    """
+    w = int(GAME_W * SCALE)
+    h = int(GAME_H * SCALE)
+    print("\nMotion scan. Idle value vs running value. F6 to stop.\n")
+    while keyboard.is_pressed("f6"):
+        time.sleep(0.01)
+
+    with mss.MSS() as sct:
+        prev = thumb(grab_bgr(sct, region, w, h))
+        last_print = 0.0
+        while not keyboard.is_pressed("f6"):
+            cur = thumb(grab_bgr(sct, region, w, h))
+            m = motion_level(prev, cur)
+            prev = cur
+            now = time.perf_counter()
+            if now - last_print > 0.25:
+                bar = "#" * min(60, int(m * 4))
+                print(f"  {m:6.2f}  {bar}")
+                last_print = now
+            time.sleep(0.01)
+    print("\nStopped.")
+
+
+def record(region, mode, args_auto=None):
     w = int(GAME_W * SCALE)
     h = int(GAME_H * SCALE)
     frame_bytes = w * h * 3
@@ -132,6 +173,18 @@ def record(region, mode):
     while keyboard.is_pressed("f6"):
         time.sleep(0.01)
 
+    # In auto mode we hold a short pre-roll so the first frames of the run
+    # are not lost while motion is still being confirmed. Without it the
+    # recording starts a few frames late and the first jump is clipped.
+    preroll = deque(maxlen=args_auto["preroll"]) if args_auto else None
+    armed = bool(args_auto)
+    running = not armed
+    quiet_since = None
+    prev_small = None
+
+    if armed:
+        print("  ARMED - waiting for motion. F6 aborts.")
+
     t0 = time.perf_counter()
 
     with open(raw_path, "wb", buffering=1024 * 1024) as fh, mss.MSS() as sct:
@@ -141,6 +194,47 @@ def record(region, mode):
 
             loop_start = time.perf_counter()
             frame = grab_bgr(sct, region, w, h)
+
+            if armed:
+                small = thumb(frame)
+                m = 0.0 if prev_small is None else motion_level(prev_small,
+                                                                small)
+                prev_small = small
+
+                if not running:
+                    preroll.append((loop_start, frame))
+                    if m >= args_auto["thresh"]:
+                        # Rewind: write the buffered frames first, and
+                        # rebase t0 to the earliest of them.
+                        t0 = preroll[0][0]
+                        for pt, pf in preroll:
+                            fh.write(pf.tobytes())
+                            times.append(round(pt - t0, 5))
+                        preroll.clear()
+                        running = True
+                        print(f"  motion detected ({m:.1f}) - RECORDING")
+                        # The current frame was appended to the pre-roll at
+                        # the top of this branch and has just been written
+                        # with the rest. Falling through would write it a
+                        # SECOND time with an identical timestamp, and a
+                        # duplicate timestamp makes np.gradient divide by
+                        # zero - corrupting velocity and acceleration for
+                        # the entire run.
+                        time.sleep(0.001)
+                        continue
+                    else:
+                        time.sleep(0.001)
+                        continue
+                else:
+                    if m < args_auto["thresh"] * 0.4:
+                        quiet_since = quiet_since or loop_start
+                        if loop_start - quiet_since > args_auto["quiet"]:
+                            print(f"  quiet for {args_auto['quiet']}s - "
+                                  f"stopping")
+                            break
+                    else:
+                        quiet_since = None
+
             fh.write(frame.tobytes())
             times.append(round(loop_start - t0, 5))
 
@@ -228,6 +322,21 @@ def main():
     g.add_argument("--ghost", action="store_true",
                    help="ghost potion replay; no taps to record")
     g.add_argument("--list", action="store_true", help="list saved runs")
+    ap.add_argument("--auto", action="store_true",
+                    help="start recording when the scene starts moving, "
+                         "stop when it goes quiet")
+    ap.add_argument("--motion-thresh", type=float, default=0.08,
+                    dest="motion_thresh",
+                    help="mean abs frame difference that counts as motion; "
+                         "find yours with --motion-scan")
+    ap.add_argument("--quiet-secs", type=float, default=1.2,
+                    dest="quiet_secs",
+                    help="seconds of stillness before auto-stop")
+    ap.add_argument("--preroll", type=int, default=20,
+                    help="frames of pre-roll kept before motion is "
+                         "confirmed, so the start is not clipped")
+    ap.add_argument("--motion-scan", action="store_true", dest="motion_scan",
+                    help="print the live motion metric and exit")
     args = ap.parse_args()
 
     if args.list:
@@ -245,6 +354,18 @@ def main():
     region = game_region(hwnd)
     print(f"Found: {title}")
     print(f"Mode:  {mode}")
+    auto_cfg = None
+    if args.auto:
+        auto_cfg = {"thresh": args.motion_thresh,
+                    "quiet": args.quiet_secs,
+                    "preroll": args.preroll}
+        print(f"Auto: start above {args.motion_thresh}, stop after "
+              f"{args.quiet_secs}s quiet, {args.preroll} frames pre-roll")
+
+    if args.motion_scan:
+        motion_scan(region)
+        return
+
     print("\nF6 = start/stop recording   F9 = quit\n")
 
     while True:
@@ -252,7 +373,7 @@ def main():
             print("Bye.")
             break
         if keyboard.is_pressed("f6"):
-            record(region, mode)
+            record(region, mode, auto_cfg)
             time.sleep(0.4)
         time.sleep(0.01)
 

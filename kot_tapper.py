@@ -31,6 +31,7 @@ Keys:
 Recordings are saved as JSON in taps/.
 """
 
+import argparse
 import ctypes
 import json
 import os
@@ -237,13 +238,30 @@ def save(taps):
     return path
 
 
-def load_latest():
+def load_taps(path=None):
+    """Load a tap file. With no argument, take the MOST RECENTLY MODIFIED
+    file in taps/.
+
+    Previously this sorted filenames alphabetically and took the last,
+    which repeatedly loaded a stale file - 'test.json' beat 'mine.json',
+    'run_233941.json' beat 'g2.json' - and silently replayed the wrong
+    sequence. Modification time is what the user actually means by "the
+    one I just made".
+    """
+    if path:
+        if not os.path.isfile(path):
+            print(f"No such file: {path}")
+            return None, None
+        with open(path) as f:
+            return json.load(f), path
+
     if not os.path.isdir(TAP_DIR):
         return None, None
-    files = sorted(f for f in os.listdir(TAP_DIR) if f.endswith(".json"))
+    files = [os.path.join(TAP_DIR, f) for f in os.listdir(TAP_DIR)
+             if f.endswith(".json")]
     if not files:
         return None, None
-    path = os.path.join(TAP_DIR, files[-1])
+    path = max(files, key=os.path.getmtime)
     with open(path) as f:
         return json.load(f), path
 
@@ -299,6 +317,11 @@ def replay(region, taps, lead_in=2.0):
 # ------------------------------------------------------------------ main
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("taps", nargs="?", help="tap JSON to load (default: "
+                                            "most recent in taps/)")
+    cli = ap.parse_args()
+
     fix_dpi()
     hwnd, title = find_window(WINDOW_TITLE)
     if not hwnd:
@@ -310,7 +333,7 @@ def main():
     print(f"Game:   {region['width']}x{region['height']} "
           f"at ({region['left']}, {region['top']})")
 
-    taps, path = load_latest()
+    taps, path = load_taps(cli.taps)
     if taps:
         print(f"Loaded {len(taps)} taps from {path}")
 
