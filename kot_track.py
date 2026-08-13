@@ -49,7 +49,7 @@ import numpy as np
 import win32api
 import win32gui
 
-WINDOW_TITLE = "LDPlayer"
+WINDOW_TITLE = "BlueStacks"
 GAME_W = 1280
 GAME_H = 720
 

@@ -60,7 +60,7 @@ import win32api
 import win32con
 import win32gui
 
-WINDOW_TITLE = "LDPlayer"
+WINDOW_TITLE = "BlueStacks"
 GAME_W, GAME_H = 1280, 720
 
 # Play area. Excludes the HUD strip (your own gold, gems, keys - all with

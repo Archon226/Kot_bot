@@ -82,7 +82,7 @@ import win32api
 import win32con
 import win32gui
 
-WINDOW_TITLE = "LDPlayer"
+WINDOW_TITLE = "BlueStacks"
 GAME_W, GAME_H = 1280, 720
 TAP_DIR = "taps"
 VK_LBUTTON = 0x01

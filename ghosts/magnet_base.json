@@ -1,0 +1,18 @@
+{
+ "source": "IMG_9491.MOV",
+ "game_w": 1280,
+ "game_h": 720,
+ "gravity": 1700.0,
+ "note": "3 launches from IMG_9491.MOV. Taps 2/3 are 170ms apart and may be one event smeared by 30fps noise - if the thief overshoots, use the 2-tap file. t=0 is the first tracked frame of the video, not the true spawn, so --offset will be needed.",
+ "anchor": {
+  "mode": "any",
+  "x": null,
+  "y": null,
+  "area": 200
+ },
+ "taps": [
+  0.6,
+  1.35,
+  1.59
+ ]
+}

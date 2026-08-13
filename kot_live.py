@@ -56,7 +56,7 @@ import mss
 import numpy as np
 import win32gui
 
-WINDOW_TITLE = "LDPlayer"
+WINDOW_TITLE = "BlueStacks"
 GAME_W, GAME_H = 1280, 720
 CROP_TOP, CROP_BOTTOM = 0.06, 0.90   # fractions of GAME_H
 
