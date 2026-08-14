@@ -60,7 +60,7 @@ import win32api
 import win32con
 import win32gui
 
-WINDOW_TITLE = "BlueStacks"
+WINDOW_TITLE = "LDPlayer"
 GAME_W, GAME_H = 1280, 720
 
 # Play area. Excludes the HUD strip (your own gold, gems, keys - all with
@@ -92,16 +92,26 @@ def find_window(sub):
     return out[0] if out else (None, None)
 
 
-def game_region(hwnd):
+def game_region(hwnd, args=None):
+    """The 1280x720 game surface inside the emulator window.
+
+    --region-x / --region-y exist because BlueStacks puts an ADVERT PANEL
+    about 228px wide down the LEFT side. Grabbing the leftmost 1280
+    columns then captures adverts and clips the game, and template
+    matching finds jewellery instead of chests.
+    """
     l, t, r, b = win32gui.GetClientRect(hwnd)
     l, t = win32gui.ClientToScreen(hwnd, (l, t))
     r, b = win32gui.ClientToScreen(hwnd, (r, b))
     cw, ch = r - l, b - t
-    pad_top = ch - GAME_H
-    if pad_top < 0 or cw - GAME_W < 0:
-        raise SystemExit(f"Window {cw}x{ch} smaller than {GAME_W}x{GAME_H}.")
-    print(f"Chrome: {pad_top}px top, {cw - GAME_W}px right")
-    return {"left": l, "top": t + pad_top, "width": GAME_W, "height": GAME_H}
+    ox = getattr(args, "region_x", 0) or 0
+    oy = getattr(args, "region_y", 0) or 0
+    if cw - ox < GAME_W or ch - oy < GAME_H:
+        raise SystemExit(f"Window {cw}x{ch} at offset ({ox},{oy}) cannot "
+                         f"hold {GAME_W}x{GAME_H}.")
+    print(f"Client {cw}x{ch}; capturing {GAME_W}x{GAME_H} at ({ox},{oy})")
+    return {"left": l + ox, "top": t + oy,
+            "width": GAME_W, "height": GAME_H}
 
 
 def focus_window(hwnd):
@@ -253,6 +263,23 @@ def glyphs_right_of(frame, x, y, h, width, args, sat=None):
             break                      # a gap this wide ends the number
         keep.append((gx, gy, gw, gh))
         prev_end = gx + gw
+    # Adjacent digits can touch and merge into one component - on a real
+    # base "32440" segmented as widths 8, 7, 18, 8, the two 4s welded
+    # together and the pair was then unrecognisable. A glyph much wider
+    # than its neighbours is not a glyph; split it into equal parts.
+    if keep and args.split_wide > 0:
+        med = float(np.median([w for _, _, w, _ in keep]))
+        out = []
+        for gx, gy, gw, gh in keep:
+            parts = int(round(gw / med)) if med > 0 else 1
+            if parts >= 2 and gw >= med * args.split_wide:
+                step = gw / parts
+                for k in range(parts):
+                    out.append((int(gx + k * step), gy, int(step), gh))
+            else:
+                out.append((gx, gy, gw, gh))
+        keep = out
+
     return [(m[gy:gy + gh, gx:gx + gw], (gx, gy, gw, gh)) for gx, gy, gw, gh
             in keep], m
 
@@ -315,6 +342,90 @@ def read_balance(frame, digits, args):
         return None
 
 
+# The three gem slots sit on the chest lid at a FIXED offset from the coin
+# icon, so the anchor that finds the gold also finds the gems - no second
+# template needed. Measured across four real chests: dx -6/+27/+59,
+# dy -46, about 18px each.
+# Slot CENTRES relative to the coin. The MIDDLE slot sits about 8px
+# higher than the outer two - the chest lid has three lobes and the
+# centre one is raised. Measured across four chests.
+GEM_SLOTS = [(4, -36), (37, -44), (69, -36)]
+
+# OpenCV hue is 0-179. Red wraps, hence two bands.
+GEM_BANDS = [("red", 0, 10), ("red", 168, 179), ("orange", 11, 22),
+             ("yellow", 23, 33), ("green", 34, 85), ("blue", 86, 125),
+             ("purple", 126, 167)]
+
+
+def read_gems(frame, cx, cy, args):
+    """Each slot as (colour, rich) where rich means a GOLD RIM.
+
+    Two samples per slot, and the split matters: the gem sits in the
+    centre, the rim is an annulus around it. Sampled together, an ORANGE
+    GEM and a GOLD RIM are the same hue and indistinguishable.
+
+    What actually separates a gold rim from an orange gem is how MUCH
+    saturated gold there is in the annulus. Measured on real chests:
+
+        gold rim   rim 245-298px, sat 195-222, hue 16-17
+        ordinary   rim  43-116px, sat  97-144
+
+    The orange-gem chest that defeats a pure hue test scores 113 rim
+    pixels against 245+ for a genuine gold rim, so the count carries the
+    decision and hue and saturation act as guards.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    H, W = frame.shape[:2]
+    out = []
+    r = args.gem_radius
+    for dx, dy in GEM_SLOTS:
+        gx, gy = cx + dx, cy + dy
+        if not (r < gx < W - r and r < gy < H - r):
+            out.append(("?", False))
+            continue
+        y0, y1 = int(gy - r * 1.2), int(gy + r * 1.2)
+        x0, x1 = int(gx - r * 1.2), int(gx + r * 1.2)
+        sub = hsv[y0:y1, x0:x1]
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        d = np.hypot(xx - gx, yy - gy)
+
+        def sample(mask):
+            px = sub[mask]
+            px = px[(px[:, 1] > args.gem_sat) & (px[:, 2] > args.gem_val)]
+            if len(px) < 8:
+                return None, None, 0
+            return int(np.median(px[:, 0])), int(np.median(px[:, 1])), len(px)
+
+        rh, rs, rn = sample((d > r * 0.72) & (d <= r * 1.15))
+        rich = (rh is not None and args.rim_lo <= rh <= args.rim_hi
+                and rs >= args.rim_sat and rn >= args.rim_min)
+
+        # On the highest tiers the gold setting spreads INTO the middle of
+        # the slot, so a plain colour sample returns gold and the gem gets
+        # called yellow. Measured on a chest of three purple gems: the
+        # middle one sampled hue 28 (gold) with everything included and
+        # hue 149 (purple) with gold excluded, while its neighbours read
+        # 146 either way.
+        #
+        # Only exclude gold when the rim says this is a gold setting -
+        # otherwise a genuinely orange or yellow GEM would be thrown away.
+        ch, _, cn = sample(d <= r * 0.55)
+        if rich:
+            core = (d <= r * 0.55)
+            px = sub[core]
+            px = px[(px[:, 1] > args.gem_sat) & (px[:, 2] > args.gem_val)]
+            ng = px[~((px[:, 0] >= args.rim_lo) & (px[:, 0] <= args.rim_hi))]
+            if len(ng) >= args.core_min:
+                ch, cn = int(np.median(ng[:, 0])), len(ng)
+
+        if ch is None or cn < args.gem_fill * (r * r):
+            out.append(("empty", False))
+            continue
+        colour = next((nm for nm, a, b in GEM_BANDS if a <= ch <= b), "?")
+        out.append((colour, rich))
+    return out
+
+
 def read_gold(frame, coin, digits, args, save_unknown=None):
     """Returns (value, note). value is None when the read is not trusted."""
     h = frame.shape[0]
@@ -338,6 +449,7 @@ def read_gold(frame, coin, digits, args, save_unknown=None):
     sats = [args.glyph_s] + [int(v) for v in args.glyph_s_alt.split(",")
                              if v.strip()]
     last = "no digits beside the coin"
+    first_note = None
     for attempt, sat in enumerate(sats):
         # Save unknown glyphs from the FIRST attempt only. The later
         # attempts use a tighter saturation ceiling to cut through
@@ -349,8 +461,10 @@ def read_gold(frame, coin, digits, args, save_unknown=None):
         if val is not None:
             return val, note + ("" if attempt == 0
                                 else f" [needed glyph-s {sat}]")
+        if attempt == 0:
+            first_note = note
         last = note
-    return None, last
+    return None, first_note or last
 
 
 def _read_with(frame, cx, cy, cw, ch, digits, args, sat, save_unknown):
@@ -442,6 +556,7 @@ def run(sct, region, hwnd, coin, skip, digits, args):
     skips = 0
     fails = 0
     seen = []
+    last_gems = None
     while skips < args.max_skips:
         if keyboard.is_pressed("f9") or keyboard.is_pressed("esc"):
             print("Stopped by key.")
@@ -512,11 +627,61 @@ def run(sct, region, hwnd, coin, skip, digits, args):
             time.sleep(args.delay)
             continue
         fails = 0
-        seen.append(val)
 
-        if val >= args.gold:
-            print(f"\n  FOUND {val:,} gold after {skips} skips. Stopping.")
-            print(f"  (seen: min {min(seen):,} median "
+        gems = []
+        if args.want or args.show_gems or args.min_rich:
+            hit = find_anchor(frame, coin, args.coin_thresh,
+                              int(frame.shape[0] * PLAY_TOP),
+                              int(frame.shape[0] * PLAY_BOTTOM))
+            if hit:
+                gems = read_gems(frame, hit[0], hit[1], args)
+
+        # The same base read twice is not two bases. In a dry run the
+        # screen-change wait can be tripped by an idle animation before
+        # you have actually skipped, and the log then shows one base five
+        # times as though five were checked.
+        if seen and val == seen[-1] and last_gems == gems:
+            time.sleep(args.delay)
+            continue
+        seen.append(val)
+        last_gems = gems
+
+        # read_gems returns (colour, rich) per slot, where rich means the
+        # gem sits in a GOLD RIM - the high-value ones.
+        want = [c for c, _ in gems if c in args.want.split(",")] \
+            if args.want else []
+        rich = [c for c, rr in gems if rr]
+        gem_ok = bool(args.want) and len(want) >= args.min_gems
+        rich_ok = args.min_rich > 0 and len(rich) >= args.min_rich
+        gold_ok = val >= args.gold
+
+        if args.log:
+            new = not os.path.isfile(args.log)
+            with open(args.log, "a") as f:
+                if new:
+                    f.write("time,gold,gem1,gem2,gem3,rich\n")
+                g = [c for c, _ in gems] + ["", "", ""]
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{val},"
+                        f"{g[0]},{g[1]},{g[2]},{len(rich)}\n")
+
+        if gems:
+            shown = ", ".join(f"{c}{'*' if rr else ''}" for c, rr in gems)
+            print(f"    gems: {shown}"
+                  + (f"   ({len(rich)} gold-rimmed)" if rich else "")
+                  + (f"   ({len(want)} wanted)" if want else ""))
+
+        if gold_ok or gem_ok or rich_ok:
+            why = []
+            if gold_ok:
+                why.append(f"{val:,} gold")
+            if gem_ok:
+                why.append(f"{len(want)}x {'/'.join(sorted(set(want)))}")
+            if rich_ok:
+                why.append(f"{len(rich)} GOLD-RIMMED "
+                           f"({'/'.join(sorted(set(rich)))})")
+            print(f"\n  FOUND {' and '.join(why)} after {skips} skips. "
+                  f"Stopping.")
+            print(f"  (gold seen: min {min(seen):,} median "
                   f"{int(np.median(seen)):,} max {max(seen):,})")
             return
         print(f"  {val:,} < {args.gold:,} - skip {skips + 1}/"
@@ -569,8 +734,49 @@ def run(sct, region, hwnd, coin, skip, digits, args):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--title", default=WINDOW_TITLE,
+                    help="emulator window title substring, e.g. BlueStacks")
+    ap.add_argument("--region-x", type=int, default=0, dest="region_x",
+                    help="px to shift the capture right; the BlueStacks "
+                         "advert panel is about 228px wide")
+    ap.add_argument("--region-y", type=int, default=0, dest="region_y")
     ap.add_argument("--gold", type=int, default=50000,
                     help="stop when a base has at least this much gold")
+    ap.add_argument("--want", default="",
+                    help="comma-separated gem colours to stop on, e.g. "
+                         "'purple,blue'. Choices: red orange yellow green "
+                         "blue purple. Combined with --gold as OR: it "
+                         "stops on either")
+    ap.add_argument("--min-gems", type=int, default=1, dest="min_gems",
+                    help="how many of the wanted colours must be present")
+    ap.add_argument("--show-gems", action="store_true", dest="show_gems",
+                    help="print the gems on every base without acting on "
+                         "them - use this first to see what is out there")
+    ap.add_argument("--min-rich", type=int, default=0, dest="min_rich",
+                    help="stop when this many gems have a GOLD RIM - the "
+                         "high-value ones. 0 disables")
+    ap.add_argument("--log", default="",
+                    help="append every base to this CSV: time, gold, the "
+                         "three gems, and how many had gold rims. Run it "
+                         "for a while and the real distribution answers "
+                         "what a skip is worth far better than a guess")
+    ap.add_argument("--gem-radius", type=int, default=12, dest="gem_radius")
+    ap.add_argument("--rim-min", type=int, default=180, dest="rim_min",
+                    help="saturated gold pixels needed in the rim. Real "
+                         "gold rims measured 245-298; an orange GEM in a "
+                         "plain slot only reached 113")
+    ap.add_argument("--core-min", type=int, default=25, dest="core_min",
+                    help="non-gold pixels needed in the centre before the "
+                         "gem colour is taken from them rather than from "
+                         "the whole slot")
+    ap.add_argument("--rim-sat", type=int, default=170, dest="rim_sat")
+    ap.add_argument("--rim-lo", type=int, default=8, dest="rim_lo")
+    ap.add_argument("--rim-hi", type=int, default=32, dest="rim_hi")
+    ap.add_argument("--gem-sat", type=int, default=110, dest="gem_sat")
+    ap.add_argument("--gem-val", type=int, default=110, dest="gem_val")
+    ap.add_argument("--gem-fill", type=float, default=0.10, dest="gem_fill",
+                    help="fraction of the slot that must be saturated "
+                         "before it counts as holding a gem")
     ap.add_argument("--max-skips", type=int, default=30, dest="max_skips",
                     help="hard cap. Skipping is not free, so this is a "
                          "spend limit as much as a safety limit")
@@ -648,6 +854,11 @@ def main():
                          "a read fails, for chests with translucent "
                          "decoration (spider web) crossing the number")
     ap.add_argument("--glyph-area", type=int, default=25, dest="glyph_area")
+    ap.add_argument("--split-wide", type=float, default=1.5,
+                    dest="split_wide",
+                    help="split a glyph this many times wider than the "
+                         "median into equal parts; touching digits merge "
+                         "into one blob otherwise. 0 disables")
     ap.add_argument("--glyph-gap", type=int, default=8, dest="glyph_gap",
                     help="px gap that ends the number")
     ap.add_argument("--strip", type=int, default=120,
@@ -671,11 +882,11 @@ def main():
               f"skip.")
 
     fix_dpi()
-    hwnd, title = find_window(WINDOW_TITLE)
+    hwnd, title = find_window(args.title)
     if not hwnd:
-        print(f"No window matching '{WINDOW_TITLE}'.")
+        print(f"No window matching '{args.title}'.")
         return
-    region = game_region(hwnd)
+    region = game_region(hwnd, args)
     print(f"Found: {title}")
 
     with mss.MSS() as sct:

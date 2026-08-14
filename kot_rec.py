@@ -154,12 +154,24 @@ def thumb(f):
                       interpolation=cv2.INTER_AREA)
 
 
-def start(sct, region, hwnd, args):
+def start(sct, region, hwnd, args, wait_motion=True):
     """Start the level and return the instant that counts as t=0.
 
     Returns the perf_counter of the start tap's DOWN edge. Recording and
     replay both produce that event the same way, which is what makes the
     two runs comparable at all.
+
+    wait_motion=False returns the moment the click lands, WITHOUT waiting
+    to confirm the scene moved. That matters for replay: t0 is already
+    known exactly when the button goes down, and blocking another 30-80ms
+    to confirm motion delays the tap LOOP, not the anchor. Any tap
+    scheduled inside that window then fires late by a varying amount -
+    measured at +34ms, +37ms and +79ms across three runs of the same
+    file, which is fatal for a tap at 0.126s.
+
+    Recording still waits, because there the confirmation costs nothing:
+    your taps are timestamped against t0 regardless of when the function
+    returns.
     """
     focus(hwnd)
     move_to(region, args.x, args.y)
@@ -168,6 +180,8 @@ def start(sct, region, hwnd, args):
 
     if args.start_tap:
         t0 = click(args.hold)
+        if not wait_motion:
+            return t0
     else:
         print("  start the level yourself...")
         t0 = None
@@ -182,7 +196,12 @@ def start(sct, region, hwnd, args):
         if m >= args.motion:
             hits += 1
             if hits >= 3:
-                return t0 if t0 is not None else time.perf_counter()
+                anchor = t0 if t0 is not None else time.perf_counter()
+                lag = time.perf_counter() - anchor
+                print(f"  anchor resolved {lag * 1000:.0f}ms after t0 "
+                      f"(motion confirmation). Taps scheduled before that "
+                      f"cannot be hit on time.")
+                return anchor
         else:
             hits = 0
     print(f"  the scene never moved (peak {m:.2f}, need {args.motion:.2f}). "
@@ -224,8 +243,38 @@ def record(sct, region, hwnd, args):
     return taps
 
 
+def check(taps):
+    """Report the two things that make a recording unreplayable.
+
+    OUT OF ORDER: a tap whose time is earlier than the one before it has
+    already passed when its turn arrives, so it fires immediately and
+    lands hundreds of ms late - the same amount every run, which looks
+    like a constant bug rather than an ordering problem. Sorting fixes it.
+
+    LONG HOLDS: hold time is dead time. The next tap cannot fire until the
+    button is released, so a 0.5s hold shoves everything after it late.
+    """
+    ordered = sorted(taps, key=lambda t: t["t"])
+    if [t["t"] for t in ordered] != [t["t"] for t in taps]:
+        print("  NOTE: taps were out of order and have been sorted.")
+        taps = ordered
+    for i, t in enumerate(taps, 1):
+        if t.get("hold", 0) > 0.2:
+            print(f"  NOTE: tap {i} holds for {t['hold'] * 1000:.0f}ms. "
+                  f"Nothing can fire until it releases - shorten it by "
+                  f"hand if the taps after it land late.")
+    gaps = [b["t"] - a["t"] for a, b in zip(taps, taps[1:])]
+    for i, g in enumerate(gaps, 2):
+        if g < taps[i - 2].get("hold", 0):
+            print(f"  NOTE: tap {i} is {g * 1000:.0f}ms after tap {i - 1}, "
+                  f"which is shorter than tap {i - 1}'s hold. It will fire "
+                  f"late. Reduce that hold to ~0.02.")
+    return taps
+
+
 def save(taps, path):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    taps = check(taps)
     json.dump({"anchor": "start_tap", "taps": taps}, open(path, "w"),
               indent=1)
     print(f"saved {path}")
@@ -248,9 +297,19 @@ def replay(sct, region, hwnd, taps, args):
     while keyboard.is_pressed("f5"):
         time.sleep(0.01)
 
-    t0 = start(sct, region, hwnd, args)
+    # Do not wait for motion confirmation here - see start(). With the
+    # start tap sent by us, t0 is exact the instant the button goes down.
+    t0 = start(sct, region, hwnd, args,
+               wait_motion=args.verify_start or not args.start_tap)
     if t0 is None:
         return
+    late = time.perf_counter() - t0
+    missed = [i for i, tp in enumerate(taps, 1)
+              if tp["t"] + args.offset < late]
+    if missed:
+        print(f"  WARNING: tap(s) {missed} are scheduled before the anchor "
+              f"was ready ({late * 1000:.0f}ms). They will fire as soon as "
+              f"possible, which is LATE and varies run to run.")
 
     for i, tp in enumerate(taps, 1):
         target = t0 + tp["t"] + args.offset
@@ -285,6 +344,11 @@ def main():
     ap.add_argument("--region-y", type=int, default=0, dest="region_y")
     ap.add_argument("--no-start-tap", action="store_false", dest="start_tap",
                     help="do not send the start tap; start it yourself")
+    ap.add_argument("--verify-start", action="store_true",
+                    dest="verify_start",
+                    help="on replay, wait to confirm the scene moved "
+                         "before firing. Safer, but it delays the first "
+                         "tap by 30-80ms and that varies run to run")
     ap.add_argument("--offset", type=float, default=0.0,
                     help="shift every replayed tap by this many seconds")
     ap.add_argument("--blank", type=float, default=0.25,
