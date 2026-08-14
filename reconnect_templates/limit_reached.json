@@ -1,5 +1,6 @@
 {
   "click_dx": 302,
   "click_dy": 316,
-  "thresh": 0.85
+  "thresh": 0.85,
+  "fatal": true
 }

@@ -44,6 +44,20 @@ Unlike kot_agent's jump timing, nothing here is time-critical to the
 millisecond - a disconnect dialog sits there until clicked. Polling
 every 2s costs nothing and avoids catching a half-drawn transition.
 
+BLUESTACKS CLOSE CONFIRMATION
+
+BlueStacks intercepts WM_CLOSE on its main window with its own native
+"Close BlueStacks App Player" popup instead of closing outright. That
+popup is a SEPARATE top-level window, not part of the client area we
+capture with mss, so close_window() used to just sit there polling
+IsWindow(hwnd) - the main window never disappears because it's hidden
+behind its own confirmation dialog, and after --close-timeout it gives
+up. find_confirm_dialog() looks for that popup by title and
+click_dialog_button() clicks its "Close" button (via BM_CLICK first,
+falling back to a physical click if the control ignores it), so
+restart_cycle() can actually get the emulator to close instead of
+timing out every time.
+
 Install:
     pip install keyboard pywin32 mss opencv-python numpy
 
@@ -65,6 +79,7 @@ import ctypes
 import json
 import os
 import random
+import subprocess
 import time
 from ctypes import wintypes
 
@@ -80,6 +95,7 @@ WINDOW_TITLE = "LDPlayer"
 GAME_W, GAME_H = 1280, 720
 TEMPLATE_DIR = "reconnect_templates"
 LOG_FILE = "reconnect_log.txt"
+CONFIRM_DIALOG_TITLE = "close bluestacks"  # substring match, case-insensitive
 
 # Set by the F9 hotkey. A POLLED keyboard.is_pressed() only sees the key
 # if it happens to be down at that instant, and this loop sleeps 2s
@@ -125,6 +141,88 @@ def find_window(substring):
 
     win32gui.EnumWindows(cb, None)
     return matches[0] if matches else (None, None)
+
+
+def find_confirm_dialog(title_substr=CONFIRM_DIALOG_TITLE):
+    """Find BlueStacks' native close-confirmation popup, if present.
+
+    This is a separate top-level window from the emulator's main window,
+    so it never shows up in game_region()/find_window() lookups for the
+    game itself - it has to be searched for on its own.
+    """
+    matches = []
+
+    def cb(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        if title_substr in win32gui.GetWindowText(hwnd).lower():
+            matches.append(hwnd)
+
+    win32gui.EnumWindows(cb, None)
+    return matches[0] if matches else None
+
+
+def click_dialog_button(dlg_hwnd, label):
+    """Click a button on the BlueStacks close-confirmation dialog.
+
+    Tries BM_CLICK on a real child control first, in case some
+    BlueStacks version does expose one. But this dialog is Qt-drawn:
+    Qt renders "Cancel"/"Close" itself inside the single top-level
+    window rather than creating a separate native button HWND for
+    each, so EnumChildWindows normally finds nothing and this falls
+    straight through to a physical click at a fixed position within
+    the dialog's own window rect.
+
+    The fallback position (x_frac, y_frac) was measured off an actual
+    "Close BlueStacks App Player" dialog screenshot: the Close button
+    sits at roughly 85% across and 78% down the dialog box. If a
+    future BlueStacks build resizes the dialog these fractions still
+    scale with it since they're relative, not pixel-fixed - but if
+    the button ever moves to a different corner (e.g. "Cancel" swaps
+    sides) this will need re-measuring against a fresh screenshot.
+    """
+    target = None
+
+    def cb(child, _):
+        nonlocal target
+        if win32gui.GetWindowText(child).strip().lower() == label.lower():
+            target = child
+        return True
+
+    win32gui.EnumChildWindows(dlg_hwnd, cb, None)
+
+    if target is not None:
+        win32gui.SendMessage(target, win32con.BM_CLICK, 0, 0)
+        time.sleep(0.3)
+        if not win32gui.IsWindow(dlg_hwnd):
+            return True
+        l, t, r, b = win32gui.GetWindowRect(target)
+        cx, cy = (l + r) // 2, (t + b) // 2
+    else:
+        # No native control - Qt custom-drawn dialog. Click by
+        # position instead of by control.
+        l, t, r, b = win32gui.GetWindowRect(dlg_hwnd)
+        w, h = r - l, b - t
+        x_frac, y_frac = (0.85, 0.78) if label.lower() == "close" \
+            else (0.60, 0.78)  # Cancel sits left of Close
+        cx, cy = l + int(w * x_frac), t + int(h * y_frac)
+
+    try:
+        win32gui.SetForegroundWindow(dlg_hwnd)
+    except Exception:
+        pass
+    time.sleep(0.1)
+    vw = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+    vh = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+    vx = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
+    vy = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+    _send(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+          int((cx - vx) * 65535 / (vw - 1)), int((cy - vy) * 65535 / (vh - 1)))
+    time.sleep(0.02)
+    _send(MOUSEEVENTF_LEFTDOWN)
+    time.sleep(0.05)
+    _send(MOUSEEVENTF_LEFTUP)
+    return True
 
 
 def game_region(hwnd, args=None):
@@ -267,7 +365,12 @@ def load_templates(folder):
         templates.append({"name": name, "img": img,
                           "click_dx": meta["click_dx"],
                           "click_dy": meta["click_dy"],
-                          "thresh": meta.get("thresh", 0.85)})
+                          "thresh": meta.get("thresh", 0.85),
+                          # "fatal": true means the dialog is recognised
+                          # but NOT recoverable - the server has decided
+                          # and its button will not clear it. Clicking is
+                          # pointless; record it and stop.
+                          "fatal": bool(meta.get("fatal", False))})
     return templates
 
 
@@ -356,6 +459,131 @@ def keepalive_click(sct, region, hwnd, tmpl, args):
     focus_window(hwnd)
     click_at(region, cx, cy, hold=0.05)
     return True, f"({cx},{cy})"
+
+
+def shot(sct, region, name):
+    """Timestamped screenshot, so every transition has evidence."""
+    fn = f"{name}_{time.strftime('%H%M%S')}.png"
+    try:
+        cv2.imwrite(fn, grab(sct, region))
+        return fn
+    except Exception as e:
+        return f"(screenshot failed: {e})"
+
+
+def close_window(hwnd, timeout=30.0):
+    """Ask the emulator to close, then wait for it to actually go.
+
+    WM_CLOSE is the polite route - it lets the emulator shut the Android
+    instance down properly rather than having its process killed out from
+    under a running app.
+
+    BlueStacks intercepts WM_CLOSE with its own native "Close BlueStacks
+    App Player" confirmation popup rather than closing outright. That
+    popup is a SEPARATE top-level window from hwnd, so the main window
+    stays alive (just hidden behind the popup) until something clicks
+    its "Close" button - without handling that, this just polls
+    IsWindow(hwnd) until timeout every single time. Poll for the popup
+    alongside the main window and click through it once it appears.
+    """
+    try:
+        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+    except Exception as e:
+        log(f"  WM_CLOSE failed ({e})")
+        return False
+
+    confirm_clicked = False
+    end = time.perf_counter() + timeout
+    while time.perf_counter() < end:
+        if not win32gui.IsWindow(hwnd):
+            return True
+        if not confirm_clicked:
+            dlg = find_confirm_dialog()
+            if dlg:
+                log("  BlueStacks close-confirmation dialog appeared - "
+                    "clicking Close")
+                if click_dialog_button(dlg, "Close"):
+                    confirm_clicked = True
+                else:
+                    log("  could not find/click the 'Close' button on the "
+                        "confirmation dialog")
+        time.sleep(0.5)
+    return False
+
+
+def restart_cycle(sct, region, hwnd, args):
+    """Close the emulator, wait, relaunch, and report what comes back.
+
+    THE POINT IS THE OBSERVATION, NOT THE RESTART. If the limit is
+    account state on the server it will still be there afterwards, and
+    that is the answer. This runs ONCE per invocation: a single restart
+    is an experiment, a loop of them would be a way of dodging the limit
+    rather than measuring it.
+    """
+    log("RESTART TEST: closing the emulator")
+    before = shot(sct, region, "restart_before")
+    log(f"  {before}")
+
+    if not close_window(hwnd, args.close_timeout):
+        log("  window did not close in time; not force-killing. Stopping.")
+        return None
+    log("  emulator closed cleanly")
+
+    log(f"  waiting {args.restart_wait:.0f}s before relaunch")
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < args.restart_wait:
+        if STOP:
+            return None
+        time.sleep(0.5)
+
+    if args.restart_exe:
+        # List form - built here from a single --restart-args string
+        # split on whitespace, then launched with shell=False. No shell
+        # is involved, so nested quotes never come up: PowerShell only
+        # has to pass ONE clean string for --restart-args, and none of
+        # its tokens (instance name, --cmd, package id) contain spaces
+        # so a plain whitespace split is enough.
+        import shlex
+        extra = shlex.split(args.restart_args, posix=False) \
+            if args.restart_args else []
+        cmd_list = [args.restart_exe] + extra
+        log(f"  launching: {cmd_list}")
+        try:
+            subprocess.Popen(cmd_list, shell=False)
+        except Exception as e:
+            log(f"  launch failed: {e}")
+            return None
+    elif args.restart_cmd:
+        log(f"  launching: {args.restart_cmd}")
+        try:
+            subprocess.Popen(args.restart_cmd, shell=True)
+        except Exception as e:
+            log(f"  launch failed: {e}")
+            return None
+    else:
+        log("  no --restart-exe/--restart-cmd given, so nothing to "
+            "launch. Start the emulator by hand; this run stops here.")
+        return None
+
+    end = time.perf_counter() + args.relaunch_timeout
+    new_hwnd = None
+    while time.perf_counter() < end:
+        if STOP:
+            return None
+        h, title = find_window(args.title)
+        if h:
+            new_hwnd = h
+            break
+        time.sleep(1.0)
+    if not new_hwnd:
+        log(f"  the window never reappeared within "
+            f"{args.relaunch_timeout:.0f}s. Stopping.")
+        return None
+    log(f"  window back after "
+        f"{time.perf_counter() - t0 - args.restart_wait:.0f}s; "
+        f"settling for {args.settle_after:.0f}s")
+    time.sleep(args.settle_after)
+    return new_hwnd
 
 
 def log(msg):
@@ -454,6 +682,10 @@ def run(sct, region, hwnd, templates, args):
     last_fire = {}
     dismissed = 0
     failures = 0
+    t_start = time.perf_counter()
+    restarted = False
+    state = "connected"
+    log(f"session start; watching {len(templates)} template(s)")
     ka_tmpl = None
     next_ka = None
     if args.keepalive:
@@ -477,9 +709,45 @@ def run(sct, region, hwnd, templates, args):
             print(f"Quit. {dismissed} dialog(s) dismissed.")
             return
 
+        if args.max_session > 0 and \
+                time.perf_counter() - t_start > args.max_session * 3600:
+            log(f"--max-session {args.max_session}h reached after "
+                f"{dismissed} dialog(s).")
+            if not (args.restart_test and not restarted):
+                log("stopping.")
+                return
+            restarted = True
+            new_hwnd = restart_cycle(sct, region, hwnd, args)
+            if new_hwnd is None:
+                return
+            hwnd = new_hwnd
+            region = game_region(hwnd, args)
+            after = shot(sct, region, "restart_after")
+            log(f"  after relaunch: {after}")
+            f2 = grab(sct, region)
+            b2 = best_match(f2, templates)
+            if b2 and b2[0].get("fatal"):
+                log(f"  RESULT: '{b2[0]['name']}' is STILL PRESENT after a "
+                    f"full restart - the restriction is account state on "
+                    f"the server, not a client-side timer.")
+                cv2.imwrite("restart_result_fatal.png", f2)
+                return
+            if b2:
+                log(f"  after relaunch the screen shows '{b2[0]['name']}'")
+            else:
+                log("  RESULT: no dialog after relaunch; the client came "
+                    "back normally. That does NOT prove the limit is gone - "
+                    "check whether the game itself still refuses to play.")
+            t_start = time.perf_counter()
+            log("  monitoring resumes; no further restarts this run.")
+
         frame = grab(sct, region)
         best = best_match(frame, templates)
         if best is None:
+            if state != "connected":
+                log(f"state: {state} -> connected "
+                    f"(t+{(time.perf_counter() - t_start) / 3600:.2f}h)")
+                state = "connected"
             # Only poke the screen when no dialog is up. Clicking into a
             # dialog would either dismiss it by accident or do nothing.
             if next_ka is not None and time.perf_counter() >= next_ka:
@@ -492,10 +760,22 @@ def run(sct, region, hwnd, templates, args):
             continue
 
         t, (x, y, score) = best
+        if state != t["name"]:
+            log(f"state: {state} -> {t['name']} "
+                f"(t+{(time.perf_counter() - t_start) / 3600:.2f}h)")
+            state = t["name"]
         now = time.perf_counter()
         if now - last_fire.get(t["name"], 0) <= args.cooldown:
             naptime(args.interval)
             continue
+
+        if t.get("fatal"):
+            log(f"FATAL '{t['name']}' score={score:.3f} - this dialog is "
+                f"marked unrecoverable, so no click is attempted.")
+            log(f"  session ran {(time.perf_counter() - t_start) / 3600:.2f}h "
+                f"before this appeared.")
+            cv2.imwrite("reconnect_fatal.png", frame)
+            return
 
         cx, cy = x + t["click_dx"], y + t["click_dy"]
         log(f"MATCH '{t['name']}' score={score:.3f} at ({x},{y}) "
@@ -533,10 +813,10 @@ def run(sct, region, hwnd, templates, args):
             log(f"  dismissed '{t['name']}' ({dismissed} total)")
         else:
             failures += 1
-            shot = f"reconnect_stuck_{failures}.png"
-            cv2.imwrite(shot, grab(sct, region))
+            stuck_shot = f"reconnect_stuck_{failures}.png"
+            cv2.imwrite(stuck_shot, grab(sct, region))
             log(f"  FAILED to dismiss '{t['name']}' after {args.max_tries} "
-                f"attempts. Wrote {shot}.")
+                f"attempts. Wrote {stuck_shot}.")
             # Stop rather than click forever. If the button moved, the
             # template is wrong, or the game wants something else first,
             # more clicks will not fix it - and an unattended click loop
@@ -603,6 +883,50 @@ def main():
                          "under the 184s idle timeout")
     ap.add_argument("--keepalive-thresh", type=float, default=0.80,
                     dest="keepalive_thresh")
+    ap.add_argument("--max-session", type=float, default=0.0,
+                    dest="max_session",
+                    help="stop the watchdog after this many hours. The "
+                         "game imposes its own limit; stopping first on "
+                         "your terms is cheaper than being locked out")
+    ap.add_argument("--restart-test", action="store_true",
+                    dest="restart_test",
+                    help="at --max-session, close the emulator, wait, "
+                         "relaunch, and record whether the restriction "
+                         "survived. Runs ONCE: a single restart measures "
+                         "the limit, a loop would dodge it")
+    ap.add_argument("--restart-cmd", default="", dest="restart_cmd",
+                    help='shell command to relaunch the emulator, e.g. '
+                         '"C:\\Program Files\\BlueStacks_nxt\\'
+                         'HD-Player.exe". Prefer --restart-exe/'
+                         '--restart-arg on PowerShell - nested quotes '
+                         'in a single --restart-cmd string get mangled '
+                         'by PowerShell\'s native-command argument '
+                         'passing.')
+    ap.add_argument("--restart-exe", default="", dest="restart_exe",
+                    help='path to the executable to relaunch, e.g. '
+                         '"C:\\Program Files\\BlueStacks_nxt\\'
+                         'HD-Player.exe". Combine with --restart-args '
+                         'for everything after the exe path. Takes '
+                         'priority over --restart-cmd if both are given.')
+    ap.add_argument("--restart-args", default="", dest="restart_args",
+                    help='everything to pass to --restart-exe, as ONE '
+                         'quoted string, e.g. "--instance Pie64 --cmd '
+                         'launchApp --package com.zeptolab.thieves.'
+                         'google --source desktop_shortcut". Split on '
+                         'whitespace and launched as a list (no shell), '
+                         'so this needs only one pair of quotes with '
+                         'nothing nested inside.')
+    ap.add_argument("--restart-wait", type=float, default=90.0,
+                    dest="restart_wait",
+                    help="seconds to stay closed before relaunching")
+    ap.add_argument("--close-timeout", type=float, default=30.0,
+                    dest="close_timeout")
+    ap.add_argument("--relaunch-timeout", type=float, default=180.0,
+                    dest="relaunch_timeout")
+    ap.add_argument("--settle-after", type=float, default=45.0,
+                    dest="settle_after",
+                    help="seconds to let the emulator boot before looking "
+                         "at the screen again")
     ap.add_argument("--calibrate", action="store_true",
                     help="teach the tool a new disconnect dialog")
     ap.add_argument("--dry-run", action="store_true",
