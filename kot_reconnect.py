@@ -38,6 +38,21 @@ disconnect (turn off wifi on the host for a few seconds), press F6 when
 the dialog appears, drag a box around the DIALOG PANEL, then click the
 button to record where to tap.
 
+AD/OFFER POPUPS ("dismiss_only" TEMPLATES)
+
+The same calibration flow also handles nuisance popups (ad offers,
+event banners) - --calibrate now asks whether a new template is one of
+these. Unlike a reconnect dialog, an ad template is matched and clicked
+on its own fast path: no fatal check, no connectivity "state" logging,
+a short dedicated --ad-cooldown instead of the long --cooldown, and the
+loop re-checks immediately (no interval wait) after closing one so a
+whole chain of stacked ads clears in quick succession instead of one
+per poll. Crop these TIGHT around just the close-X icon, not the ad
+panel behind it - the panel content changes per ad, but games usually
+reuse the same close-icon graphic across different offers, so a tight
+crop of just the icon generalizes to future ads instead of matching
+only the one you calibrated against.
+
 WHY POLL SLOWLY
 
 Unlike kot_agent's jump timing, nothing here is time-critical to the
@@ -370,7 +385,18 @@ def load_templates(folder):
                           # but NOT recoverable - the server has decided
                           # and its button will not clear it. Clicking is
                           # pointless; record it and stop.
-                          "fatal": bool(meta.get("fatal", False))})
+                          "fatal": bool(meta.get("fatal", False)),
+                          # "dismiss_only": true means this is a
+                          # nuisance popup (ad offers, event banners) -
+                          # not a connectivity state. Handled on its own
+                          # fast path in run(): no fatal check, no
+                          # "state: X -> Y" logging, a much shorter
+                          # cooldown, and the loop re-checks immediately
+                          # after closing one instead of waiting out the
+                          # normal poll interval, so a chain of several
+                          # ads gets cleared in quick succession.
+                          "dismiss_only": bool(meta.get("dismiss_only",
+                                                        False))})
     return templates
 
 
@@ -660,15 +686,29 @@ def calibrate(sct, region, hwnd):
             if not name:
                 print("Empty name, discarded.")
                 continue
+            dismiss_only = input(
+                "Is this a nuisance/ad popup close-X, not a connection "
+                "dialog? Ads get a fast rapid-close path instead of the "
+                "normal state tracking and cooldown. [y/N]: "
+            ).strip().lower().startswith("y")
             cv2.imwrite(os.path.join(TEMPLATE_DIR, name + ".png"), crop)
             with open(os.path.join(TEMPLATE_DIR, name + ".json"), "w") as f:
                 json.dump({"click_dx": point[0] - x, "click_dy": point[1] - y,
-                           "thresh": 0.85}, f, indent=2)
+                           "thresh": 0.85, "dismiss_only": dismiss_only},
+                          f, indent=2)
             print(f"Saved {name}.png ({w}x{h}) / {name}.json — click offset "
-                  f"({point[0] - x}, {point[1] - y}).")
+                  f"({point[0] - x}, {point[1] - y})"
+                  f"{', dismiss_only' if dismiss_only else ''}.")
             print(f"  Open {os.path.join(TEMPLATE_DIR, name + '.png')} and "
                   f"confirm it's the dialog panel - not your editor, not "
                   f"the whole screen - before trusting it.")
+            if dismiss_only:
+                print("  Ad templates work best cropped TIGHT around just "
+                      "the close-X icon itself, not the ad panel behind "
+                      "it - the panel content changes per ad, but the "
+                      "same X icon graphic is usually reused across "
+                      "different offers, so a tight crop generalizes to "
+                      "future ads instead of matching only this one.")
             time.sleep(0.3)
         time.sleep(0.02)
 
@@ -681,6 +721,7 @@ def run(sct, region, hwnd, templates, args):
     print(f"Polling every {args.interval}s. F9 to quit.")
     last_fire = {}
     dismissed = 0
+    ads_dismissed = 0
     failures = 0
     t_start = time.perf_counter()
     restarted = False
@@ -706,14 +747,23 @@ def run(sct, region, hwnd, templates, args):
 
     while True:
         if STOP:
-            print(f"Quit. {dismissed} dialog(s) dismissed.")
+            print(f"Quit. {dismissed} dialog(s), {ads_dismissed} ad(s) "
+                  f"dismissed.")
             return
 
         if args.max_session > 0 and \
                 time.perf_counter() - t_start > args.max_session * 3600:
             log(f"--max-session {args.max_session}h reached after "
                 f"{dismissed} dialog(s).")
-            if not (args.restart_test and not restarted):
+            # --restart-loop repeats the restart every --max-session hours
+            # forever, for unattended AFK runs. --restart-test (without
+            # --restart-loop) still does it exactly ONCE per invocation,
+            # as originally designed - that flag exists to answer "does
+            # this limit survive a restart", and looping it would answer
+            # a different question than the one it was built for.
+            do_restart = args.restart_loop or \
+                (args.restart_test and not restarted)
+            if not do_restart:
                 log("stopping.")
                 return
             restarted = True
@@ -739,7 +789,9 @@ def run(sct, region, hwnd, templates, args):
                     "back normally. That does NOT prove the limit is gone - "
                     "check whether the game itself still refuses to play.")
             t_start = time.perf_counter()
-            log("  monitoring resumes; no further restarts this run.")
+            log("  monitoring resumes"
+                + (f"; next restart in ~{args.max_session:.1f}h"
+                   if args.restart_loop else "; no further restarts this run."))
 
         frame = grab(sct, region)
         best = best_match(frame, templates)
@@ -760,6 +812,44 @@ def run(sct, region, hwnd, templates, args):
             continue
 
         t, (x, y, score) = best
+
+        if t.get("dismiss_only"):
+            # Ad/offer popups: no connectivity "state" involved, no
+            # fatal check, a short dedicated cooldown, and - after a
+            # successful close - loop straight back around instead of
+            # sleeping the full --interval/--cooldown, so a chain of
+            # several stacked ads gets cleared quickly and control lands
+            # back on the game rather than pausing between each one.
+            now = time.perf_counter()
+            if now - last_fire.get(t["name"], 0) <= args.ad_cooldown:
+                naptime(args.interval)
+                continue
+            cx, cy = x + t["click_dx"], y + t["click_dy"]
+            log(f"AD '{t['name']}' score={score:.3f} at ({x},{y}) "
+                f"-> click ({cx},{cy})"
+                + (" [dry-run, not clicking]" if args.dry_run else ""))
+            last_fire[t["name"]] = now
+            if args.dry_run:
+                naptime(args.interval)
+                continue
+            focus_window(hwnd)
+            naptime(args.pre_click)
+            click_at(region, cx, cy, hold=0.06)
+            wait_settled(sct, region, quiet=args.quiet,
+                         timeout=args.settle_timeout)
+            if verify_gone(sct, region, t["img"], t["thresh"],
+                           args.verify_secs):
+                ads_dismissed += 1
+                log(f"  ad closed ({ads_dismissed} total)")
+            else:
+                log(f"  '{t['name']}' still showing after click; will "
+                    f"retry next pass")
+            # Short pause, then straight back to the top of the loop to
+            # check for another ad immediately - not the full poll
+            # interval, since ad chains fire back-to-back.
+            naptime(0.15)
+            continue
+
         if state != t["name"]:
             log(f"state: {state} -> {t['name']} "
                 f"(t+{(time.perf_counter() - t_start) / 3600:.2f}h)")
@@ -845,6 +935,13 @@ def main():
                     help="seconds between polls (default 2.0)")
     ap.add_argument("--cooldown", type=float, default=6.0,
                     help="min seconds between clicks on the same template")
+    ap.add_argument("--ad-cooldown", type=float, default=1.5,
+                    dest="ad_cooldown",
+                    help="min seconds between clicks on the same "
+                         "dismiss_only (ad) template - short on purpose "
+                         "so a chain of ads clears quickly, unlike the "
+                         "much longer --cooldown used for reconnect "
+                         "dialogs")
     ap.add_argument("--quiet", type=float, default=0.4,
                     help="seconds of stillness that count as settled")
     ap.add_argument("--settle-timeout", type=float, default=5.0,
@@ -894,6 +991,12 @@ def main():
                          "relaunch, and record whether the restriction "
                          "survived. Runs ONCE: a single restart measures "
                          "the limit, a loop would dodge it")
+    ap.add_argument("--restart-loop", action="store_true",
+                    dest="restart_loop",
+                    help="like --restart-test but repeats every "
+                         "--max-session hours for as long as the "
+                         "watchdog runs, for unattended AFK sessions - "
+                         "not just once")
     ap.add_argument("--restart-cmd", default="", dest="restart_cmd",
                     help='shell command to relaunch the emulator, e.g. '
                          '"C:\\Program Files\\BlueStacks_nxt\\'
