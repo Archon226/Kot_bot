@@ -1,9 +1,49 @@
+# Raw captures. A 13-second run at 640x360 colour is ~560MB, so these must
+# never reach the repository - GitHub rejects files over 100MB and history
+# would be unrecoverable if one slipped in.
 runs/
 *.raw
-*_png/
+
+# Generated during analysis; all reproducible from a run.
 *_debug/
+*_png/
 shots/
+*_bg.png
+
+# kot_skipper diagnostics
+skipper_calib.png
+skipper_frame.png
+skipper_fail_*.png
+gems.csv
+*.csv
+
+# kot_ghost diagnostics
+acq_frame.png
+acq_mask.png
+scan_frame.png
+scan_mask.png
+
+# kot_agent / kot_live
+agent_bg.png
+live_bg.png
+
+# kot_reconnect: log and evidence screenshots
+reconnect_log.txt
+reconnect_stuck_*.png
+reconnect_fatal.png
+restart_before_*.png
+restart_after_*.png
+restart_result_fatal.png
+
+# Unlabelled digit glyphs are scratch - saved for you to identify and
+# rename into the templates folder. Anything left here is unidentified.
+digits/unlabeled/
+
+# Recorded tap sequences are per-dungeon and personal. Delete this line to
+# version your solutions.
 taps/
+
+# Python
 __pycache__/
 *.pyc
 .venv/
