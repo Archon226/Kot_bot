@@ -24,6 +24,49 @@ so rounding cannot compound across a run.
 Usage:
     python kot_rec.py --title BlueStacks --region-x 228
     python kot_rec.py --title BlueStacks --region-x 228 --no-start-tap
+
+LOOPS
+-----
+A recording is normally a flat list of {"t", "hold"} taps. If part of the
+run is just the same handful of taps repeating on a fixed interval (a
+farming loop, a wave of enemies, whatever), you don't have to write out
+every repeat by hand. The file can instead hold a "loops" block:
+
+    {
+     "anchor": "start_tap",
+     "taps": [ {"t": 0.1353, "hold": 0.0875}, ... a few one-off taps ... ],
+     "loops": [
+       {
+        "start": 4.8107,          # t of the first tap of the first cycle
+        "period": 3.8577,         # seconds between one cycle start and the next
+        "count": 22,              # how many times the cycle repeats
+        "taps": [                 # one cycle, times relative to the cycle start
+         {"t": 0.0,    "hold": 0.0875},
+         {"t": 0.95,   "hold": 0.0875},
+         {"t": 2.84,   "hold": 0.0875},
+         {"t": 3.04,   "hold": 0.0875}
+        ]
+       }
+     ]
+    }
+
+"taps" holds anything that only happens once (an intro, an outro, or the
+whole recording if there's nothing repeating). "loops" holds any number of
+repeating blocks. At load time both are expanded into one flat, sorted tap
+list, so replay() never has to know the difference. Bump "count" and the
+whole cycle plays that many extra times - no need to hand-copy 4 taps
+22 times into 88 lines.
+
+To turn an already-recorded flat file into that compact form automatically:
+
+    python kot_rec.py --file taps/base130.json --compact
+
+This looks for the single longest repeating cycle in the recording (same
+gaps, same holds, within a small tolerance) and rewrites the file as
+one-off taps + a loop block. It does not touch the emulator, so no window
+needs to be open for it. Recording (F6) always writes the plain flat form;
+run --compact afterwards if you want to shrink it, and hand-tune "count"
+whenever you want more or fewer repeats.
 """
 
 import argparse
@@ -280,11 +323,114 @@ def save(taps, path):
     print(f"saved {path}")
 
 
+def expand_loops(data):
+    """Turn {"taps": [...], "loops": [...]} into one flat, sorted tap list.
+
+    A loop block's own "taps" are offsets from its "start"; cycle i's tap
+    lands at start + i*period + offset, for i in 0..count-1. Plain one-off
+    taps (anything that only happens once, before/after/between loops) live
+    in the top-level "taps" list untouched. Old files with no "loops" key
+    still load exactly as before.
+    """
+    if isinstance(data, list):
+        flat = list(data)
+    else:
+        flat = list(data.get("taps", []))
+        for loop in data.get("loops", []):
+            start = loop["start"]
+            period = loop["period"]
+            count = loop["count"]
+            cycle = loop["taps"]
+            for i in range(count):
+                base = start + i * period
+                for tp in cycle:
+                    flat.append({"t": round(base + tp["t"], 4),
+                                 "hold": tp.get("hold", 0)})
+    return sorted(flat, key=lambda t: t["t"])
+
+
 def load(path):
     if not os.path.isfile(path):
         return []
     d = json.load(open(path))
-    return d.get("taps", d if isinstance(d, list) else [])
+    return expand_loops(d)
+
+
+def auto_compact(taps, tol=0.01):
+    """Find the single longest run of taps that repeats on a fixed
+    interval and fold it into one loop block. Returns None if nothing
+    repeats at least twice, otherwise {"taps": leftover, "loops": [loop]}
+    ready to json.dump straight to a file.
+
+    tol is the slack (seconds) allowed when comparing a tap's time or hold
+    against where the pattern predicts it should be - recordings are never
+    perfectly periodic by hand, so exact equality would never match.
+    """
+    taps = sorted(taps, key=lambda t: t["t"])
+    n = len(taps)
+    best = None  # (covered, start, L, period, cycles, end_index)
+
+    for start in range(n):
+        max_L = (n - start) // 2
+        for L in range(1, max_L + 1):
+            period = taps[start + L]["t"] - taps[start]["t"]
+            if period <= tol:
+                continue
+            cycles = 1
+            i = start + L
+            while i + L <= n:
+                ok = True
+                for j in range(L):
+                    exp_t = taps[start + j]["t"] + cycles * period
+                    if abs(taps[i + j]["t"] - exp_t) > tol:
+                        ok = False
+                        break
+                    if abs(taps[i + j].get("hold", 0) -
+                           taps[start + j].get("hold", 0)) > tol:
+                        ok = False
+                        break
+                if not ok:
+                    break
+                cycles += 1
+                i += L
+            covered = cycles * L
+            if cycles >= 2 and (best is None or covered > best[0]):
+                best = (covered, start, L, period, cycles, i)
+
+    if best is None:
+        return None
+
+    _, start, L, period, cycles, end = best
+    cycle_taps = [{"t": round(taps[start + j]["t"] - taps[start]["t"], 4),
+                   "hold": taps[start + j].get("hold", 0)} for j in range(L)]
+    loop = {"start": round(taps[start]["t"], 4),
+            "period": round(period, 4),
+            "count": cycles,
+            "taps": cycle_taps}
+    leftover = taps[:start] + taps[end:]
+    return {"taps": leftover, "loops": [loop]}
+
+
+def compact_file(path, tol=0.01):
+    if not os.path.isfile(path):
+        print(f"no such file: {path}")
+        return
+    flat = load(path)  # expands any existing loops first, so re-running is safe
+    if not flat:
+        print("nothing to compact.")
+        return
+    result = auto_compact(flat, tol=tol)
+    if result is None:
+        print(f"{len(flat)} taps, no repeating cycle found (nothing "
+              f"repeats at least twice within tol={tol}s) - left as-is.")
+        return
+    loop = result["loops"][0]
+    json.dump({"anchor": "start_tap", **result}, open(path, "w"), indent=1)
+    print(f"{len(flat)} taps -> {len(result['taps'])} one-off + "
+          f"1 loop ({len(loop['taps'])} taps x {loop['count']} reps, "
+          f"period {loop['period']}s starting at t={loop['start']}s).")
+    print(f"saved {path}. Edit \"count\" in the loop block any time to "
+          f"change how many times it repeats.")
 
 
 # ------------------------------------------------------------------ replay
@@ -359,7 +505,19 @@ def main():
     ap.add_argument("--hold", type=float, default=0.05)
     ap.add_argument("--x", type=int, default=640)
     ap.add_argument("--y", type=int, default=360)
+    ap.add_argument("--compact", action="store_true",
+                    help="don't touch the emulator - just look at --file, "
+                         "find the longest repeating tap cycle, and "
+                         "rewrite the file as one-off taps + a loop block "
+                         "(see the LOOPS section at the top of this file)")
+    ap.add_argument("--compact-tol", type=float, default=0.01, dest="compact_tol",
+                    help="seconds of slack allowed when matching a "
+                         "repeating cycle during --compact")
     args = ap.parse_args()
+
+    if args.compact:
+        compact_file(args.file, tol=args.compact_tol)
+        return
 
     fix_dpi()
     hwnd, title = find_window(args.title)

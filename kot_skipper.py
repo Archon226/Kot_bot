@@ -26,6 +26,22 @@ anywhere in the play area and the digits are read from immediately right
 of it. The HUD strip and the button bar are excluded because they contain
 coin icons too - your own gold at the top, the skip cost at the bottom.
 
+RESOLUTION INDEPENDENCE
+
+assets/coin.png, assets/skip.png, and every fixed-pixel measurement below
+(the HUD gold box, the three gem-slot offsets, the digit-strip search
+width, glyph-area thresholds...) were measured against real 1280x720
+screenshots. Older versions of this script required the BlueStacks/
+LDPlayer client area to be at least that size and refused to run
+otherwise.
+
+This version captures whatever the emulator window's client area
+actually is - any size, any aspect ratio - and rescales the coin/skip
+templates and every one of those pixel measurements to match, based on
+the ratio between the real capture size and the 1280x720 reference. So
+the same assets/ and digits/ folders work whether BlueStacks is a small
+window or a maximised 1920x1080 screen.
+
 BOOTSTRAPPING THE DIGITS
 
 digits/ ships with 0,1,3,5,7 extracted from a real screenshot. The other
@@ -61,10 +77,17 @@ import win32con
 import win32gui
 
 WINDOW_TITLE = "LDPlayer"
+
+# Reference resolution. coin.png/skip.png and every fixed-pixel constant
+# below (HUD_GOLD, GEM_SLOTS, and the --strip/--gem-radius/--glyph-area
+# style CLI defaults) were measured against screenshots at this size.
+# main() computes how far the REAL capture differs from this and scales
+# everything accordingly - this is not an enforced minimum any more.
 GAME_W, GAME_H = 1280, 720
 
 # Play area. Excludes the HUD strip (your own gold, gems, keys - all with
 # coin icons) and the button bar (the skip button's own cost icon).
+# Expressed as fractions of the frame height, so these need no scaling.
 PLAY_TOP, PLAY_BOTTOM = 0.10, 0.88
 
 DIGIT_SIZE = (12, 24)
@@ -93,12 +116,18 @@ def find_window(sub):
 
 
 def game_region(hwnd, args=None):
-    """The 1280x720 game surface inside the emulator window.
+    """The emulator's game surface, captured at whatever resolution the
+    window ACTUALLY is right now.
 
-    --region-x / --region-y exist because BlueStacks puts an ADVERT PANEL
-    about 228px wide down the LEFT side. Grabbing the leftmost 1280
-    columns then captures adverts and clips the game, and template
-    matching finds jewellery instead of chests.
+    Older versions required the client area to be at least 1280x720 and
+    raised SystemExit otherwise. This version captures whatever is
+    there - any size - and main() rescales the coin/skip templates and
+    every fixed-pixel measurement (HUD box, gem slot offsets, digit-strip
+    sizes, etc) from the 1280x720 reference they were measured at, to
+    match. So the same assets/ and digits/ work at any window size.
+
+    --region-x / --region-y still exist because some emulator layouts put
+    an ADVERT PANEL down the side. Use 0 if there is none.
     """
     l, t, r, b = win32gui.GetClientRect(hwnd)
     l, t = win32gui.ClientToScreen(hwnd, (l, t))
@@ -106,12 +135,27 @@ def game_region(hwnd, args=None):
     cw, ch = r - l, b - t
     ox = getattr(args, "region_x", 0) or 0
     oy = getattr(args, "region_y", 0) or 0
-    if cw - ox < GAME_W or ch - oy < GAME_H:
-        raise SystemExit(f"Window {cw}x{ch} at offset ({ox},{oy}) cannot "
-                         f"hold {GAME_W}x{GAME_H}.")
-    print(f"Client {cw}x{ch}; capturing {GAME_W}x{GAME_H} at ({ox},{oy})")
+
+    if ox < 0 or oy < 0:
+        raise SystemExit(f"Invalid region offset ({ox},{oy}). Offsets "
+                         f"cannot be negative.")
+
+    cap_w, cap_h = cw - ox, ch - oy
+
+    if cap_w <= 0 or cap_h <= 0:
+        raise SystemExit(f"Region offset ({ox},{oy}) is outside the "
+                         f"{cw}x{ch} client area.")
+
+    print(f"Client {cw}x{ch}; capturing {cap_w}x{cap_h} at ({ox},{oy})")
+
+    if (cap_w, cap_h) != (GAME_W, GAME_H):
+        print(f"  NOTE: differs from the {GAME_W}x{GAME_H} reference the "
+              f"assets were measured at - templates/geometry will be "
+              f"auto-scaled by ({cap_w / GAME_W:.3f}x, "
+              f"{cap_h / GAME_H:.3f}x).")
+
     return {"left": l + ox, "top": t + oy,
-            "width": GAME_W, "height": GAME_H}
+            "width": cap_w, "height": cap_h}
 
 
 def focus_window(hwnd):
@@ -203,6 +247,39 @@ def wait_settled(sct, region, quiet, timeout):
     return False
 
 
+# ------------------------------------------------------- resolution scaling
+
+def scale_image(img, sx, sy):
+    """Resize an image by independent x/y scale factors. Returns it
+    unchanged if the factors are effectively 1.0."""
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    new_w = max(1, int(round(w * sx)))
+    new_h = max(1, int(round(h * sy)))
+    if new_w == w and new_h == h:
+        return img
+    interp = cv2.INTER_AREA if (new_w < w or new_h < h) else cv2.INTER_LINEAR
+    return cv2.resize(img, (new_w, new_h), interpolation=interp)
+
+
+def raw_score(frame, tmpl, y0=None, y1=None):
+    """Best match score for a template against the frame, IGNORING any
+    threshold - used purely for --calibrate diagnostics so you can tell a
+    near-miss (score close to threshold) from a total miss (score near
+    zero). Returns None if the template is too big for the search area."""
+    if tmpl is None:
+        return None
+    sub = frame if y0 is None else frame[y0:y1]
+    if sub.size == 0:
+        return None
+    if tmpl.shape[0] > sub.shape[0] or tmpl.shape[1] > sub.shape[1]:
+        return None
+    res = cv2.matchTemplate(sub, tmpl, cv2.TM_CCOEFF_NORMED)
+    _, score, _, _ = cv2.minMaxLoc(res)
+    return float(score)
+
+
 def load_templates(folder):
     coin = cv2.imread(os.path.join(folder, "coin.png"))
     skip = cv2.imread(os.path.join(folder, "skip.png"))
@@ -239,6 +316,11 @@ def glyphs_right_of(frame, x, y, h, width, args, sat=None):
     returned six components for "51037" - the sixth was chest scenery
     13px further right and 6px lower. Keeping only the contiguous run that
     shares a baseline with the first glyph discards it.
+
+    Note: args.strip, args.strip_back and args.glyph_area/glyph_gap are
+    all in CURRENT-resolution pixels by the time this runs - main()
+    rescales them from their 1280x720 reference values before the loop
+    starts, so this function itself needs no resolution awareness.
     """
     strip = frame[max(0, y - 4):y + h + 4, max(0, x - args.strip_back):
                   x - args.strip_back + width]
@@ -297,6 +379,10 @@ def classify(glyph, digits, thresh, margin):
     won by 0.33 to 0.59. So requiring a margin over the runner-up
     separates "I recognise this" from "this is the least bad of five
     wrong answers", which a threshold cannot do.
+
+    This step is already resolution-independent: the captured glyph is
+    resized to the fixed DIGIT_SIZE before comparison, regardless of what
+    resolution it was captured at, so digit recognition needs no scaling.
     """
     g = cv2.resize(glyph, DIGIT_SIZE, interpolation=cv2.INTER_AREA)
     scores = sorted(((float(cv2.matchTemplate(g, t,
@@ -310,14 +396,16 @@ def classify(glyph, digits, thresh, margin):
     return best[1], best[0]
 
 
-# Your own gold, top-left. Same bitmap font as the chest plate, verified
-# against real frames: 1186 and 253 both read exactly.
-HUD_GOLD = (150, 0, 330, 50)      # x0, y0, x1, y1 in game coords
+# Your own gold, top-left, measured at the 1280x720 reference resolution.
+# Same bitmap font as the chest plate, verified against real frames: 1186
+# and 253 both read exactly. main() rescales this into args.hud_gold to
+# match the actual capture resolution before use.
+HUD_GOLD = (150, 0, 330, 50)      # x0, y0, x1, y1 in reference-res pixels
 
 
 def read_balance(frame, digits, args):
     """Your gold. Returns None if it cannot be read - never a guess."""
-    x0, y0, x1, y1 = HUD_GOLD
+    x0, y0, x1, y1 = getattr(args, "hud_gold", HUD_GOLD)
     hud = frame[y0:y1, x0:x1]
     if hud.size == 0:
         return None
@@ -343,9 +431,11 @@ def read_balance(frame, digits, args):
 
 
 # The three gem slots sit on the chest lid at a FIXED offset from the coin
-# icon, so the anchor that finds the gold also finds the gems - no second
-# template needed. Measured across four real chests: dx -6/+27/+59,
-# dy -46, about 18px each.
+# icon (measured at the 1280x720 reference resolution), so the anchor
+# that finds the gold also finds the gems - no second template needed.
+# Measured across four real chests: dx -6/+27/+59, dy -46, about 18px
+# each. main() rescales these into args.gem_slots before use.
+#
 # Slot CENTRES relative to the coin. The MIDDLE slot sits about 8px
 # higher than the outer two - the chest lid has three lobes and the
 # centre one is raised. Measured across four chests.
@@ -373,12 +463,16 @@ def read_gems(frame, cx, cy, args):
     The orange-gem chest that defeats a pure hue test scores 113 rim
     pixels against 245+ for a genuine gold rim, so the count carries the
     decision and hue and saturation act as guards.
+
+    args.gem_slots / args.gem_radius / args.rim_min / args.core_min are
+    all already scaled to the current capture resolution by main().
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     H, W = frame.shape[:2]
     out = []
     r = args.gem_radius
-    for dx, dy in GEM_SLOTS:
+    slots = getattr(args, "gem_slots", GEM_SLOTS)
+    for dx, dy in slots:
         gx, gy = cx + dx, cy + dy
         if not (r < gx < W - r and r < gy < H - r):
             out.append(("?", False))
@@ -525,24 +619,46 @@ def calibrate(sct, region, coin, skip, digits, args):
     hit = find_anchor(frame, coin, args.coin_thresh, y0, y1)
     vis = frame.copy()
     cv2.rectangle(vis, (0, y0), (frame.shape[1], y1), (60, 60, 60), 1)
+
+    # Report the coin match either way: FOUND with its score, or NOT
+    # FOUND with the best score it came up with anyway. A near-miss
+    # (score just under threshold) means "lower --coin-thresh a touch or
+    # recalibrate the asset"; a score near zero means "wrong region,
+    # wrong screen, or the wrong emulator window is focused".
+    best_coin = raw_score(frame, coin, y0, y1)
     if hit:
-        cx, cy, _ = hit
+        cx, cy, score = hit
         ch, cw = coin.shape[:2]
         cv2.rectangle(vis, (cx, cy), (cx + cw, cy + ch), (0, 255, 0), 2)
         cv2.rectangle(vis, (cx + cw, cy - 4),
                       (cx + cw + args.strip, cy + ch + 4), (0, 200, 255), 1)
+        print(f"coin icon: FOUND at ({cx},{cy})  score {score:.3f} "
+              f"(need {args.coin_thresh})")
+    else:
+        print(f"coin icon: NOT found - best score "
+              f"{best_coin:.3f} " if best_coin is not None else "N/A "
+              f"(need {args.coin_thresh}) - is a raid/base screen showing?")
+
     sh = find_anchor(frame, skip, args.skip_thresh)
+    best_skip = raw_score(frame, skip)
     if sh:
         sx, sy, ss = sh
         th, tw = skip.shape[:2]
         cv2.rectangle(vis, (sx, sy), (sx + tw, sy + th), (255, 0, 255), 2)
-        print(f"skip button found at ({sx + tw // 2},{sy + th // 2}) "
-              f"score {ss:.2f}")
+        print(f"skip button: FOUND at ({sx + tw // 2},{sy + th // 2}) "
+              f"score {ss:.3f} (need {args.skip_thresh})")
     else:
-        print("skip button NOT found - is the raid screen showing?")
+        print(f"skip button: NOT found - best score "
+              f"{best_skip:.3f} " if best_skip is not None else "N/A "
+              f"(need {args.skip_thresh}) - is the raid screen showing?")
+
     cv2.imwrite("skipper_calib.png", vis)
     print("\nwrote skipper_frame.png and skipper_calib.png")
     print("  green = coin anchor   amber = digit strip   magenta = skip")
+    if (args.scale_x, args.scale_y) != (1.0, 1.0):
+        print(f"  (assets/geometry auto-scaled by "
+              f"{args.scale_x:.3f}x / {args.scale_y:.3f}y for this "
+              f"{region['width']}x{region['height']} capture)")
 
 
 def run(sct, region, hwnd, coin, skip, digits, args):
@@ -617,7 +733,10 @@ def run(sct, region, hwnd, coin, skip, digits, args):
             print("  --on-fail skip: skipping it unread.")
             sh = find_anchor(frame, skip, args.skip_thresh)
             if sh is None:
-                print("  skip button not found - stopping.")
+                best = raw_score(frame, skip)
+                print(f"  skip button not found "
+                      f"(best score {best:.3f})" if best is not None
+                      else "  skip button not found." + " stopping.")
                 break
             if not args.dry_run:
                 sx, sy, _ = sh
@@ -695,7 +814,10 @@ def run(sct, region, hwnd, coin, skip, digits, args):
 
         sh = find_anchor(frame, skip, args.skip_thresh)
         if sh is None:
-            print("  skip button not found - stopping.")
+            best = raw_score(frame, skip)
+            print("  skip button not found - stopping."
+                  + (f" (best score {best:.3f} vs need "
+                     f"{args.skip_thresh})" if best is not None else ""))
             if bal is not None and bal < args.skip_cost * 2:
                 print(f"  your gold is {bal:,} and a skip costs "
                       f"{args.skip_cost} - almost certainly out of gold.")
@@ -737,8 +859,8 @@ def main():
     ap.add_argument("--title", default=WINDOW_TITLE,
                     help="emulator window title substring, e.g. BlueStacks")
     ap.add_argument("--region-x", type=int, default=0, dest="region_x",
-                    help="px to shift the capture right; the BlueStacks "
-                         "advert panel is about 228px wide")
+                    help="px to shift the capture right; some emulator "
+                         "layouts have an advert panel on one side")
     ap.add_argument("--region-y", type=int, default=0, dest="region_y")
     ap.add_argument("--gold", type=int, default=50000,
                     help="stop when a base has at least this much gold")
@@ -760,13 +882,18 @@ def main():
                          "three gems, and how many had gold rims. Run it "
                          "for a while and the real distribution answers "
                          "what a skip is worth far better than a guess")
-    ap.add_argument("--gem-radius", type=int, default=12, dest="gem_radius")
+    ap.add_argument("--gem-radius", type=int, default=12, dest="gem_radius",
+                    help="pixels, measured at the 1280x720 reference "
+                         "resolution - auto-scaled to your actual capture "
+                         "size")
     ap.add_argument("--rim-min", type=int, default=180, dest="rim_min",
-                    help="saturated gold pixels needed in the rim. Real "
-                         "gold rims measured 245-298; an orange GEM in a "
-                         "plain slot only reached 113")
+                    help="saturated gold pixels needed in the rim, at the "
+                         "1280x720 reference resolution (auto-scaled). "
+                         "Real gold rims measured 245-298; an orange GEM "
+                         "in a plain slot only reached 113")
     ap.add_argument("--core-min", type=int, default=25, dest="core_min",
-                    help="non-gold pixels needed in the centre before the "
+                    help="non-gold pixels (reference resolution, "
+                         "auto-scaled) needed in the centre before the "
                          "gem colour is taken from them rather than from "
                          "the whole slot")
     ap.add_argument("--rim-sat", type=int, default=170, dest="rim_sat")
@@ -785,7 +912,9 @@ def main():
     ap.add_argument("--calibrate", action="store_true",
                     help="show what it sees on the current screen, no taps")
     ap.add_argument("--assets", default="assets",
-                    help="folder with coin.png and skip.png")
+                    help="folder with coin.png and skip.png, captured at "
+                         "the 1280x720 reference resolution (auto-scaled "
+                         "to your actual capture size)")
     ap.add_argument("--digits", default="digits",
                     help="folder with 0.png .. 9.png")
     ap.add_argument("--delay", type=float, default=0.6,
@@ -845,24 +974,30 @@ def main():
                          "0.012 and turned 167100 into 7100. 0.06 sits in "
                          "that gap")
     ap.add_argument("--strip-back", type=int, default=8, dest="strip_back",
-                    help="px to reach back over the coin when looking for "
-                         "the first digit; chests vary in spacing")
+                    help="px (reference resolution, auto-scaled) to reach "
+                         "back over the coin when looking for the first "
+                         "digit; chests vary in spacing")
     ap.add_argument("--glyph-v", type=int, default=190, dest="glyph_v")
     ap.add_argument("--glyph-s", type=int, default=70, dest="glyph_s")
     ap.add_argument("--glyph-s-alt", default="30,20", dest="glyph_s_alt",
                     help="stricter saturation ceilings tried IN ORDER when "
                          "a read fails, for chests with translucent "
                          "decoration (spider web) crossing the number")
-    ap.add_argument("--glyph-area", type=int, default=25, dest="glyph_area")
+    ap.add_argument("--glyph-area", type=int, default=25, dest="glyph_area",
+                    help="min pixel AREA for a glyph blob, at the "
+                         "1280x720 reference resolution - auto-scaled by "
+                         "the capture's area ratio")
     ap.add_argument("--split-wide", type=float, default=1.5,
                     dest="split_wide",
                     help="split a glyph this many times wider than the "
                          "median into equal parts; touching digits merge "
                          "into one blob otherwise. 0 disables")
     ap.add_argument("--glyph-gap", type=int, default=8, dest="glyph_gap",
-                    help="px gap that ends the number")
+                    help="px (reference resolution, auto-scaled) gap that "
+                         "ends the number")
     ap.add_argument("--strip", type=int, default=120,
-                    help="px to the right of the coin searched for digits")
+                    help="px (reference resolution, auto-scaled) to the "
+                         "right of the coin searched for digits")
     ap.add_argument("--change-timeout", type=float, default=30.0,
                     dest="change_timeout",
                     help="dry run only: how long to wait for you to skip "
@@ -888,6 +1023,41 @@ def main():
         return
     region = game_region(hwnd, args)
     print(f"Found: {title}")
+
+    # ----------------------------------------------------------------
+    # Resolution independence: scale the coin/skip templates and every
+    # fixed-pixel measurement from the 1280x720 reference they were
+    # captured/measured at, to whatever the ACTUAL capture size is.
+    # Everything downstream already receives `args`, so attaching the
+    # scaled geometry there means read_balance/read_gems/glyphs_right_of
+    # etc need no signature changes.
+    # ----------------------------------------------------------------
+    sx = region["width"] / GAME_W
+    sy = region["height"] / GAME_H
+
+    coin = scale_image(coin, sx, sy)
+    skip = scale_image(skip, sx, sy)
+
+    args.scale_x, args.scale_y = sx, sy
+    args.hud_gold = (
+        int(round(HUD_GOLD[0] * sx)), int(round(HUD_GOLD[1] * sy)),
+        int(round(HUD_GOLD[2] * sx)), int(round(HUD_GOLD[3] * sy)),
+    )
+    args.gem_slots = [
+        (int(round(dx * sx)), int(round(dy * sy))) for dx, dy in GEM_SLOTS
+    ]
+    args.gem_radius = max(1, int(round(args.gem_radius * (sx + sy) / 2)))
+    args.strip = max(1, int(round(args.strip * sx)))
+    args.strip_back = max(1, int(round(args.strip_back * sx)))
+    args.glyph_gap = max(1, int(round(args.glyph_gap * sx)))
+    args.glyph_area = max(1, int(round(args.glyph_area * sx * sy)))
+    args.rim_min = max(1, int(round(args.rim_min * sx * sy)))
+    args.core_min = max(1, int(round(args.core_min * sx * sy)))
+
+    if (round(sx, 3), round(sy, 3)) != (1.0, 1.0):
+        print(f"  scaled coin/skip templates and on-screen geometry by "
+              f"({sx:.3f}x, {sy:.3f}x) for a {region['width']}x"
+              f"{region['height']} capture")
 
     with mss.MSS() as sct:
         if args.calibrate:
