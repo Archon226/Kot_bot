@@ -24,6 +24,57 @@ so rounding cannot compound across a run.
 Usage:
     python kot_rec.py --title BlueStacks --region-x 228
     python kot_rec.py --title BlueStacks --region-x 228 --no-start-tap
+    python kot_rec.py --title LDPlayer
+    python kot_rec.py --title MuMuPlayer
+
+EMULATOR SUPPORT
+
+--title matches any substring of the emulator's window title, so any
+emulator works as long as its window can be found this way - LDPlayer,
+BlueStacks, MuMu Player, NoxPlayer, whatever. What differs between them is
+--region-x/--region-y: the offset from the window's client-area origin to
+where the actual Android screen starts, because some emulators surround
+the game with their own chrome (an ad panel, a sidebar of shortcut icons).
+
+KNOWN_EMULATOR_OFFSETS below auto-fills --region-x when --title matches a
+known name and you didn't pass --region-x yourself:
+
+  - BlueStacks: 228px, measured directly off a real BlueStacks window (its
+    left-side ad panel).
+  - LDPlayer, MuMu Player: 0px. LDPlayer's own window doesn't add a
+    persistent side panel the way BlueStacks does, and MuMu Player
+    doesn't ship one by default either - but this has NOT been measured
+    against a real MuMu window the way BlueStacks was, so treat 0 as an
+    untested default, not a confirmed value. If taps land in the wrong
+    place on MuMu, check for a toolbar/sidebar around the Android screen
+    in the actual window and pass --region-x/--region-y yourself to
+    correct it - see CALIBRATING A NEW EMULATOR below.
+
+Passing --region-x/--region-y explicitly always overrides the guess for
+any emulator, known or not.
+
+CALIBRATING A NEW EMULATOR (or fixing a wrong guess)
+
+1. Open the emulator, load the game so the Android screen is visible.
+2. Take a screenshot of the whole emulator window.
+3. Measure, in pixels, the offset from the window's client area (below
+   its own titlebar, right of any toolbar/sidebar it draws) to the
+   top-left corner of the actual Android screen inside it.
+4. Pass those numbers as --region-x/--region-y. If they're right, the
+   game_region() print at startup describes a box that should exactly
+   match the Android screen - sanity-check it against the screenshot.
+
+RESOLUTION
+
+The capture size is NOT fixed to 1280x720 - it uses whatever the emulator
+window's client area actually measures (minus --region-x/--region-y), so
+a smaller window (e.g. an 860x580 MuMu instance) works without complaint.
+--width/--height exist only to pin an exact size if you specifically want
+one regardless of the real window - leave them unset otherwise.
+
+--x/--y (where the start tap lands) default to the center of whatever
+gets captured, not a hardcoded 640,360 - that number assumed a 1280x720
+screen and landed off-center (or off-window) at any other resolution.
 
 LOOPS
 -----
@@ -84,8 +135,21 @@ import win32api
 import win32con
 import win32gui
 
-GAME_W, GAME_H = 1280, 720
 VK_LBUTTON = 0x01
+
+# Substring (lowercase) -> default --region-x, used when --title matches
+# and --region-x was not given explicitly. See EMULATOR SUPPORT in the
+# module docstring for how these were determined and which are unverified.
+KNOWN_EMULATOR_OFFSETS = {
+    "bluestacks": 228,   # measured off a real BlueStacks window
+    "ldplayer": 0,
+    "mumu": 0,           # untested guess - no ad panel by default, but not
+                         # measured against a real MuMu window like
+                         # BlueStacks was; verify and override if wrong
+    "android device": 0, # MuMu Player's actual window title is "Android
+                         # Device", not "MuMuPlayer" - same untested guess
+                         # as "mumu" above, just matching the real title
+}
 
 
 def fix_dpi():
@@ -109,18 +173,36 @@ def find_window(sub):
 
 
 def game_region(hwnd, args):
+    """Capture region sized to whatever the window actually is.
+
+    Used to hardcode 1280x720 and reject any window smaller than that -
+    which is exactly what broke on an 860x580 MuMu window: nothing about
+    tap timing depends on a specific resolution (taps are recorded/replayed
+    as {t, hold} only, never as x,y coordinates), so there was never a
+    real reason to require one fixed size. --width/--height let a person
+    pin an exact size if they want it (e.g. matching a template library
+    calibrated elsewhere); left unset, this just uses whatever the client
+    area minus the offset actually measures.
+    """
     l, t, r, b = win32gui.GetClientRect(hwnd)
     l, t = win32gui.ClientToScreen(hwnd, (l, t))
     r, b = win32gui.ClientToScreen(hwnd, (r, b))
     cw, ch = r - l, b - t
-    if cw - args.region_x < GAME_W or ch - args.region_y < GAME_H:
+    avail_w, avail_h = cw - args.region_x, ch - args.region_y
+    if avail_w <= 0 or avail_h <= 0:
+        raise SystemExit(f"Window {cw}x{ch} at offset "
+                         f"({args.region_x},{args.region_y}) leaves no "
+                         f"room to capture anything.")
+    w = args.width if args.width else avail_w
+    h = args.height if args.height else avail_h
+    if w > avail_w or h > avail_h:
         raise SystemExit(f"Window {cw}x{ch} at offset "
                          f"({args.region_x},{args.region_y}) cannot hold "
-                         f"{GAME_W}x{GAME_H}.")
-    print(f"Client {cw}x{ch}; capturing {GAME_W}x{GAME_H} at "
+                         f"the requested {w}x{h}.")
+    print(f"Client {cw}x{ch}; capturing {w}x{h} at "
           f"({args.region_x},{args.region_y})")
     return {"left": l + args.region_x, "top": t + args.region_y,
-            "width": GAME_W, "height": GAME_H}
+            "width": w, "height": h}
 
 
 def focus(hwnd):
@@ -331,21 +413,38 @@ def expand_loops(data):
     taps (anything that only happens once, before/after/between loops) live
     in the top-level "taps" list untouched. Old files with no "loops" key
     still load exactly as before.
+
+    Each tap that comes from a loop is tagged with "cycle_id" (which
+    repetition it belongs to) and "cycle_offset" (its time relative to
+    that repetition's own first tap). The first tap of every repetition
+    additionally gets "resync": True. None of this affects plain
+    open-loop replay - see replay()'s handling of these keys - but it's
+    what --resync uses to re-anchor each repetition against the screen
+    instead of trusting t0 + n*period after enough repetitions for any
+    rate mismatch to compound into a real problem. Plain one-off taps
+    (and anything loaded from an old flat file) simply don't have these
+    keys and are scheduled exactly as before.
     """
     if isinstance(data, list):
         flat = list(data)
     else:
         flat = list(data.get("taps", []))
-        for loop in data.get("loops", []):
+        for loop_idx, loop in enumerate(data.get("loops", [])):
             start = loop["start"]
             period = loop["period"]
             count = loop["count"]
             cycle = loop["taps"]
             for i in range(count):
                 base = start + i * period
-                for tp in cycle:
-                    flat.append({"t": round(base + tp["t"], 4),
-                                 "hold": tp.get("hold", 0)})
+                cid = f"{loop_idx}:{i}"
+                for j, tp in enumerate(cycle):
+                    entry = {"t": round(base + tp["t"], 4),
+                             "hold": tp.get("hold", 0),
+                             "cycle_id": cid,
+                             "cycle_offset": round(tp["t"], 4)}
+                    if j == 0:
+                        entry["resync"] = True
+                    flat.append(entry)
     return sorted(flat, key=lambda t: t["t"])
 
 
@@ -435,11 +534,65 @@ def compact_file(path, tol=0.01):
 
 # ------------------------------------------------------------------ replay
 
+def wait_for_resync(sct, region, predicted, args):
+    """Watch the screen around a predicted cycle-start time and return the
+    ACTUAL perf_counter moment scene motion is confirmed, instead of
+    trusting the extrapolated t0 + n*period blindly.
+
+    Pure open-loop timing - scheduling every tap at a fixed offset from t0
+    with no further feedback - compounds any mismatch between the
+    recorded period and the game's actual rate on every single repeat.
+    Over enough cycles a tiny, otherwise-unnoticeable rate mismatch adds
+    up to real drift (compare: a 1% mismatch is already the better part
+    of a second by cycle 25-30), which is exactly the shape of a loop
+    that survives dozens of reps before suddenly missing timing. Re-
+    detecting the real trigger at the START of every cycle means each
+    cycle's error resets to zero instead of stacking on the last one -
+    the same idea as start(), just re-run once per repeat instead of once
+    per whole replay.
+
+    Returns None (caller falls back to the predicted time) if no motion
+    is confirmed within the window - a missed detection should degrade to
+    the old behavior for that one cycle, not abort the whole replay.
+    """
+    window = args.resync_window
+    start_watching = predicted - window
+    end_watching = predicted + window
+    while time.perf_counter() < start_watching:
+        if keyboard.is_pressed("esc") or keyboard.is_pressed("f9"):
+            return "abort"
+        time.sleep(0.005)
+    prev = thumb(grab(sct, region))
+    hits = 0
+    while time.perf_counter() < end_watching:
+        cur = thumb(grab(sct, region))
+        m = float(np.abs(cur.astype(np.int16) - prev.astype(np.int16)).mean())
+        prev = cur
+        if m >= args.motion:
+            hits += 1
+            if hits >= 2:  # lighter than start()'s 3 - the window here is
+                          # short, so a slower confirmation could run past it
+                return time.perf_counter()
+        else:
+            hits = 0
+        time.sleep(0.005)
+    return None
+
+
 def replay(sct, region, hwnd, taps, args):
     if not taps:
         print("Nothing recorded. Press F6 first.")
         return
     print(f"\nREPLAY - {len(taps)} taps. ESC aborts.")
+    if args.resync:
+        n_cycles = len({tp["cycle_id"] for tp in taps if "cycle_id" in tp})
+        if n_cycles:
+            print(f"  --resync on: {n_cycles} loop repetition(s) will "
+                  f"re-anchor against screen motion instead of "
+                  f"accumulating drift over the whole replay.")
+        else:
+            print("  --resync on, but this file has no loop cycles to "
+                  "resync - no effect.")
     while keyboard.is_pressed("f5"):
         time.sleep(0.01)
 
@@ -457,8 +610,28 @@ def replay(sct, region, hwnd, taps, args):
               f"was ready ({late * 1000:.0f}ms). They will fire as soon as "
               f"possible, which is LATE and varies run to run.")
 
+    cycle_base = {}  # cycle_id -> actual perf_counter time of that
+                      # repetition's first tap, once resynced
     for i, tp in enumerate(taps, 1):
-        target = t0 + tp["t"] + args.offset
+        cid = tp.get("cycle_id")
+        if args.resync and tp.get("resync"):
+            predicted = t0 + tp["t"] + args.offset
+            actual = wait_for_resync(sct, region, predicted, args)
+            if actual == "abort":
+                print("aborted.")
+                return
+            if actual is None:
+                print(f"  tap {i:2d}/{len(taps)}  cycle {cid}: no motion "
+                      f"detected in the resync window - using predicted "
+                      f"time for this cycle (drift not corrected here).")
+                actual = predicted
+            cycle_base[cid] = actual
+            target = actual
+        elif cid is not None and cid in cycle_base:
+            target = cycle_base[cid] + tp["cycle_offset"]
+        else:
+            target = t0 + tp["t"] + args.offset
+
         while True:
             left = target - time.perf_counter()
             if left <= 0.002:
@@ -483,10 +656,14 @@ def main():
                          "own file, e.g. taps/base130.json - the campaign "
                          "levels and raid bases are all different runs")
     ap.add_argument("--title", default="LDPlayer",
-                    help="emulator window title substring")
-    ap.add_argument("--region-x", type=int, default=0, dest="region_x",
-                    help="px to shift capture right (BlueStacks ad panel "
-                         "is about 228)")
+                    help="emulator window title substring - LDPlayer, "
+                         "BlueStacks, MuMuPlayer, etc all work as long as "
+                         "the substring matches the real window title")
+    ap.add_argument("--region-x", type=int, default=None, dest="region_x",
+                    help="px to shift capture right. Auto-fills from "
+                         "KNOWN_EMULATOR_OFFSETS when --title matches a "
+                         "known emulator and this is omitted - pass a "
+                         "value explicitly to override the guess")
     ap.add_argument("--region-y", type=int, default=0, dest="region_y")
     ap.add_argument("--no-start-tap", action="store_false", dest="start_tap",
                     help="do not send the start tap; start it yourself")
@@ -503,8 +680,20 @@ def main():
                     help="scene motion that counts as the level starting")
     ap.add_argument("--timeout", type=float, default=8.0)
     ap.add_argument("--hold", type=float, default=0.05)
-    ap.add_argument("--x", type=int, default=640)
-    ap.add_argument("--y", type=int, default=360)
+    ap.add_argument("--width", type=int, default=None,
+                    help="capture width in px. Default: use whatever the "
+                         "window's client area measures (minus "
+                         "--region-x) - only set this to pin an exact "
+                         "size regardless of the actual window")
+    ap.add_argument("--height", type=int, default=None,
+                    help="capture height in px. Same default behavior "
+                         "as --width")
+    ap.add_argument("--x", type=int, default=None,
+                    help="start-tap x, in capture-relative px. Default: "
+                         "horizontal center of the actual capture region")
+    ap.add_argument("--y", type=int, default=None,
+                    help="start-tap y, in capture-relative px. Default: "
+                         "vertical center of the actual capture region")
     ap.add_argument("--compact", action="store_true",
                     help="don't touch the emulator - just look at --file, "
                          "find the longest repeating tap cycle, and "
@@ -513,11 +702,42 @@ def main():
     ap.add_argument("--compact-tol", type=float, default=0.01, dest="compact_tol",
                     help="seconds of slack allowed when matching a "
                          "repeating cycle during --compact")
+    ap.add_argument("--resync", action="store_true",
+                    help="on replay, re-anchor each loop repetition "
+                         "against actual screen motion instead of "
+                         "trusting t0 + n*period the whole way through - "
+                         "fixes drift that compounds over many repeats "
+                         "(see wait_for_resync()). No effect on files "
+                         "with no loop cycles.")
+    ap.add_argument("--resync-window", type=float, default=0.4,
+                    dest="resync_window",
+                    help="how many seconds before/after the predicted "
+                         "cycle start to watch for motion when --resync "
+                         "is on. Widen this if cycles are drifting by "
+                         "more than the default window can catch")
     args = ap.parse_args()
 
     if args.compact:
         compact_file(args.file, tol=args.compact_tol)
         return
+
+    if args.region_x is None:
+        # Silently defaulting to 0 here would mean BlueStacks (which DOES
+        # need 228) silently captures the wrong 228px-wide strip with no
+        # error - every match would just quietly fail. Look up a default
+        # by title instead of trusting the flag to be remembered, same
+        # fix as kot_reconnect.py needed after that exact bug showed up
+        # there.
+        match = next((name for name in KNOWN_EMULATOR_OFFSETS
+                     if name in args.title.lower()), None)
+        if match:
+            args.region_x = KNOWN_EMULATOR_OFFSETS[match]
+            note = " (unverified default - confirm this)" \
+                if match in ("mumu", "android device") else ""
+            print(f"  --region-x not given; defaulting to "
+                  f"{args.region_x} for '{match}'{note}.")
+        else:
+            args.region_x = 0
 
     fix_dpi()
     hwnd, title = find_window(args.title)
@@ -526,6 +746,17 @@ def main():
         return
     region = game_region(hwnd, args)
     print(f"Found: {title}")
+
+    if args.x is None or args.y is None:
+        # Center of whatever region actually got captured, not a fixed
+        # 640,360 that assumed a 1280x720 screen - that default landed
+        # off-center (or off-window entirely) on any other resolution.
+        if args.x is None:
+            args.x = region["width"] // 2
+        if args.y is None:
+            args.y = region["height"] // 2
+        print(f"  --x/--y not given; defaulting to center of capture "
+              f"({args.x},{args.y}).")
 
     taps = load(args.file)
     if taps:
